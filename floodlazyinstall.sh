@@ -6,6 +6,6 @@ nvm install v14.17.3 && nvm use v14.17.3 && nvm alias default v14.17.3 && nvm in
 mkdir build; cd build && git clone https://github.com/jesec/flood.git &&\
 cd flood &&\
 npm install &&\
-npm run buil d&&\
+npm run build d&&\
 npm --global install &&\
 npm --global run build
