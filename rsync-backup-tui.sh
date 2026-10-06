@@ -4,8 +4,8 @@ set -Eeuo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CORE="$HERE/rsync-backup-tui-bash-core.sh"
 [[ -r "$CORE" ]] || { echo "Missing core: $CORE" >&2; exit 1; }
+
 # Load the previous stable implementation without executing its final main call.
-# The wrapper below overrides only format-aware choices, summary and execution.
 source <(sed '$d' "$CORE")
 VER='2.1'
 
@@ -17,8 +17,23 @@ IMG_LIVE_OK=0
 linux_target(){ [[ $DFS =~ ^(btrfs|ext[234]|xfs|f2fs)$ ]]; }
 windows_target(){ [[ $DFS =~ ^(ntfs|ntfs3|fuseblk|exfat|vfat)$ ]]; }
 
+zstd_parallelism(){
+  local n c
+  local -a a
+  n=$(nproc 2>/dev/null||echo 1)
+  a=("All threads ($n) — fastest" "Half threads ($((n>1?n/2:1))) — leave CPU headroom" 'Single thread — lowest CPU pressure')
+  c=$(choose 'zstd parallelism' 0 "${a[@]}")
+  case $c in
+    0) ZTH=0;;
+    1) ZTH=$((n>1?n/2:1));;
+    2) ZTH=1;;
+  esac
+}
+
 format_options(){
-  local c a=()
+  local c meta_default=N
+  local -a a=()
+  linux_target && meta_default=Y || :
   ui
   echo "Selected format: $STRAT"
   echo
@@ -35,10 +50,10 @@ format_options(){
       echo
       waitkey
       RSYNC_ACL=0; RSYNC_XATTR=0; RSYNC_HARD=0; RSYNC_NUMID=0; RSYNC_DELETE=0
-      yes 'Preserve ACLs (-A)?' "$([[ $(linux_target; echo $?) == 0 ]]&&echo Y||echo N)" && RSYNC_ACL=1 || :
-      yes 'Preserve extended attributes/xattrs (-X)?' "$([[ $(linux_target; echo $?) == 0 ]]&&echo Y||echo N)" && RSYNC_XATTR=1 || :
+      yes 'Preserve ACLs (-A)?' "$meta_default" && RSYNC_ACL=1 || :
+      yes 'Preserve extended attributes/xattrs (-X)?' "$meta_default" && RSYNC_XATTR=1 || :
       yes 'Preserve hard links (-H)?' Y && RSYNC_HARD=1 || :
-      yes 'Preserve numeric UID/GID (--numeric-ids)?' "$([[ $(linux_target; echo $?) == 0 ]]&&echo Y||echo N)" && RSYNC_NUMID=1 || :
+      yes 'Preserve numeric UID/GID (--numeric-ids)?' "$meta_default" && RSYNC_NUMID=1 || :
       ui
       echo 'Optional mirror mode:'
       echo '  --delete removes destination files that no longer exist in the source.'
@@ -50,9 +65,7 @@ format_options(){
       echo 'tar.zst stores a Linux-aware tar archive and compresses it with parallel zstd.'
       echo 'ACLs, xattrs, owners and permissions can remain inside the archive even when the destination is NTFS/exFAT.'
       echo 'Unlike rsync, it is not directly incremental and individual files require archive extraction.'
-      if [[ $SFS == btrfs ]]; then
-        echo 'Btrfs snapshots remain excluded by the source rules unless you explicitly re-add them.'
-      fi
+      [[ $SFS == btrfs ]] && echo 'Btrfs snapshots remain excluded by the source rules unless you explicitly re-add them.'
       echo
       waitkey
       TAR_META=0
@@ -60,6 +73,7 @@ format_options(){
       a=('Level 1 — fastest / least compression' 'Level 3 — balanced [recommended]' 'Level 6 — stronger compression / more CPU' 'Level 9 — high compression / slower')
       c=$(choose 'zstd compression level' 1 "${a[@]}")
       case $c in 0) ZLVL=1;; 1) ZLVL=3;; 2) ZLVL=6;; 3) ZLVL=9;; esac
+      zstd_parallelism
       ;;
     zip)
       echo 'ZIP prioritizes Windows compatibility and convenient file-by-file access.'
@@ -80,19 +94,22 @@ format_options(){
       ;;
     img|img.zst)
       echo 'IMG is a block-level image of the entire backing partition/device.'
-      echo 'Filesystem exclusions, cache filters and Btrfs snapshot exclusions DO NOT apply: every allocated/unallocated block is represented.'
+      echo 'Filesystem exclusions, cache filters and Btrfs snapshot exclusions DO NOT apply: every block is represented.'
       echo 'A live mounted read/write filesystem can change during imaging and therefore produce an inconsistent image.'
       echo
       waitkey
       IMG_LIVE_OK=0
       if findmnt -rn -S "${SDEV%%\[*}" >/dev/null 2>&1; then
-        yes 'Source block device appears mounted. Continue with a live image anyway?' N && IMG_LIVE_OK=1 || {
-          echo 'Image mode cancelled because live block imaging was not confirmed.'
+        if yes 'Source block device appears mounted. Continue with a live image anyway?' N; then
+          IMG_LIVE_OK=1
+        else
+          ui
+          echo 'Image mode cancelled. Choose another backup format.'
           waitkey
           strategy
           format_options
           return
-        }
+        fi
       else
         IMG_LIVE_OK=1
       fi
@@ -100,10 +117,11 @@ format_options(){
         a=('Level 1 — fastest' 'Level 3 — balanced [recommended]' 'Level 6 — stronger compression' 'Level 9 — high compression')
         c=$(choose 'zstd compression level for image' 1 "${a[@]}")
         case $c in 0) ZLVL=1;; 1) ZLVL=3;; 2) ZLVL=6;; 3) ZLVL=9;; esac
+        zstd_parallelism
       fi
       ;;
   esac
-  log "FORMAT_OPTIONS strat=$STRAT rsync_acl=$RSYNC_ACL rsync_xattr=$RSYNC_XATTR rsync_hard=$RSYNC_HARD rsync_numid=$RSYNC_NUMID rsync_delete=$RSYNC_DELETE tar_meta=$TAR_META zip_level=$ZIP_LEVEL zip_split=$ZIP_SPLIT zstd_level=$ZLVL"
+  log "FORMAT_OPTIONS strat=$STRAT rsync_acl=$RSYNC_ACL rsync_xattr=$RSYNC_XATTR rsync_hard=$RSYNC_HARD rsync_numid=$RSYNC_NUMID rsync_delete=$RSYNC_DELETE tar_meta=$TAR_META zip_level=$ZIP_LEVEL zip_split=$ZIP_SPLIT zstd_level=$ZLVL zstd_threads=$ZTH"
 }
 
 summary(){
@@ -123,11 +141,11 @@ EOF
     rsync)
       cat <<EOF
 rsync options:
-  preserve ACLs:          $([[ $RSYNC_ACL == 1 ]]&&echo yes||echo no)
-  preserve xattrs:        $([[ $RSYNC_XATTR == 1 ]]&&echo yes||echo no)
-  preserve hard links:    $([[ $RSYNC_HARD == 1 ]]&&echo yes||echo no)
-  preserve numeric IDs:   $([[ $RSYNC_NUMID == 1 ]]&&echo yes||echo no)
-  delete destination extras: $([[ $RSYNC_DELETE == 1 ]]&&echo YES||echo no)
+  preserve ACLs:              $([[ $RSYNC_ACL == 1 ]]&&echo yes||echo no)
+  preserve xattrs:            $([[ $RSYNC_XATTR == 1 ]]&&echo yes||echo no)
+  preserve hard links:        $([[ $RSYNC_HARD == 1 ]]&&echo yes||echo no)
+  preserve numeric IDs:       $([[ $RSYNC_NUMID == 1 ]]&&echo yes||echo no)
+  delete destination extras:  $([[ $RSYNC_DELETE == 1 ]]&&echo YES||echo no)
 EOF
       ;;
     tar.zst)
@@ -155,7 +173,10 @@ Image options:
   live mounted source confirmed: $([[ $IMG_LIVE_OK == 1 ]]&&echo yes||echo no)
   exclusions applied: NO
 EOF
-      [[ $STRAT == img.zst ]] && printf '  zstd level: %s\n  zstd threads: %s\n  GPG encryption: %s\n' "$ZLVL" "$([[ $ZTH == 0 ]]&&echo all||echo "$ZTH")" "$([[ $GPG_PASS == 1 ]]&&echo yes||echo no)"
+      if [[ $STRAT == img.zst ]]; then
+        printf '  zstd level: %s\n  zstd threads: %s\n  GPG encryption: %s\n' \
+          "$ZLVL" "$([[ $ZTH == 0 ]]&&echo all||echo "$ZTH")" "$([[ $GPG_PASS == 1 ]]&&echo yes||echo no)"
+      fi
       ;;
   esac
   echo
@@ -165,8 +186,8 @@ EOF
 }
 
 execute(){
-  local sudo= need=0 x p dir tgt dev flags tarflags=() zipargs=()
-  local -a args=()
+  local sudo= need=0 x p dir tgt dev flags
+  local -a args=() tarflags=() zipargs=()
   [[ $SRC == / || $STRAT == img* || ! -w $DST ]] && need=1
   ((need)) && priv
   ((EUID!=0&&need)) && sudo='sudo -n '
@@ -186,7 +207,7 @@ execute(){
       ;;
     tar.zst)
       tarflags=(tar -C "$SRC" -cpf -)
-      if ((TAR_META)); then tarflags=(tar --acls --xattrs --numeric-owner -C "$SRC" -cpf -); fi
+      ((TAR_META)) && tarflags=(tar --acls --xattrs --numeric-owner -C "$SRC" -cpf -)
       p="${sudo}$(q "${tarflags[@]}")$(tarex) . | zstd -q -$ZLVL -T$ZTH -c"
       if ((GPG_PASS)); then
         export GPG_TTY="$(tty 2>/dev/null||:)"
@@ -250,13 +271,6 @@ main(){
   yes 'Run safe zstd CPU benchmark in tmpfs?' Y && cpu_bench || :
   yes 'Run destination I/O benchmark with temporary file?' N && io_bench || :
   strategy
-  if [[ $STRAT == tar.zst || $STRAT == img.zst ]]; then
-    local n c; local -a a
-    n=$(nproc 2>/dev/null||echo 1)
-    a=("All threads ($n)" "Half threads ($((n>1?n/2:1)))" 'Single thread')
-    c=$(choose 'zstd parallelism' 0 "${a[@]}")
-    case $c in 0) ZTH=0;; 1) ZTH=$((n>1?n/2:1));; 2) ZTH=1;; esac
-  fi
   format_options
   home_root
   passwords
