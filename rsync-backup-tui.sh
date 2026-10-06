@@ -1,219 +1,258 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BASE="$HERE/rsync-backup-tui-bash-core.sh"
-PREV="$HERE/rsync-backup-tui-format-core.sh"
-[[ -r $BASE && -r $PREV ]] || { echo "Missing backup TUI core files in $HERE" >&2; exit 1; }
+CORE="$HERE/rsync-backup-tui-object-core.sh"
+[[ -r $CORE ]] || { echo "Missing object-aware core: $CORE" >&2; exit 1; }
 
-# Load stable v2.0 + previous format-aware v2.1 without their final main calls.
-source <(sed '$d' "$BASE")
-source <(tail -n +10 "$PREV" | sed '$d')
-VER='2.2'
+# Load v2.2 without executing its final main call.
+source <(sed '$d' "$CORE")
+VER='2.3'
 
-# Keep callable copies of previous implementations.
-eval "$(declare -f execute | sed '1s/^execute /execute_v21 /')"
-eval "$(declare -f summary | sed '1s/^summary /summary_v21 /')"
+eval "$(declare -f summary | sed '1s/^summary /summary_v22 /')"
+eval "$(declare -f execute | sed '1s/^execute /execute_v22 /')"
 
-SRC_KIND=unknown; SRC_HINT=''; OUT_KIND=new; OVERWRITE=0
+TRANSPORT=local
+NET_SCOPE=LAN
+SSH_HOST=''; SSH_USER="${USER:-}"; SSH_PORT=22; SSH_KEY=''; SSH_COMP=0
+REMOTE_PATH='~/backups/'; REMOTE_IS_DIR=1
 
-kindof(){
-  local p=$1 mt
-  [[ -b $p ]] && { echo block; return; }
-  [[ -f $p ]] && { echo file; return; }
-  if [[ -d $p ]]; then
-    mt=$(findmnt -T "$p" -rn -o TARGET 2>/dev/null||:)
-    [[ -n $mt && $(real "$mt") == "$(real "$p")" ]] && echo mountpoint || echo directory
-    return
+private_host(){
+  local h=${1,,}
+  [[ $h == localhost || $h == *.local || $h == 127.* || $h == 10.* || $h == 192.168.* ]] && return 0
+  [[ $h =~ ^172\.([1][6-9]|2[0-9]|3[01])\. ]] && return 0
+  [[ $h == ::1 || $h == fc*:* || $h == fd*:* || $h == fe80:* ]] && return 0
+  return 1
+}
+
+transport_choose(){
+  local -a opts keys
+  local c
+  opts=('Local mounted storage — current behavior')
+  keys=(local)
+  if have ssh && have rsync && [[ $SRC_KIND != block ]]; then
+    opts+=('Direct rsync over SSH — recommended for LAN/WAN incremental copy')
+    keys+=(rsync-ssh)
   fi
-  [[ -L $p ]] && echo symlink || echo missing
-}
-compressed_file(){ [[ $SRC_KIND == file && ${SRC,,} =~ \.(zip|7z|rar|gz|bz2|xz|zst|lz4|jpg|jpeg|png|gif|webp|avif|heic|mp3|aac|ogg|opus|flac|mp4|mkv|webm|mov|avi|pdf|apk|iso)$ ]]; }
-
-source_info(){
-  SRC_KIND=$(kindof "$SRC")
-  case $SRC_KIND in
-    file)
-      if compressed_file; then SRC_HINT='Already-compressed/media/archive file detected: direct copy is normally preferable to recompression.'
-      else SRC_HINT='Single file detected: direct rsync copy is simplest; tar.zst/ZIP are optional packaging formats.'
-      fi;;
-    directory) SRC_HINT='Directory detected: rsync is best for browsable/incremental backup; tar.zst/ZIP create one archive.';;
-    mountpoint) SRC_HINT='Filesystem mountpoint detected: rsync/tar/ZIP are available; raw IMG is also offered as an advanced option.';;
-    block) SRC_HINT='Block device detected: raw IMG/IMG.ZST is the appropriate backup family.';;
-    *) SRC_HINT='Unsupported source object.';;
-  esac
-  ui; echo "Detected source: $SRC_KIND"; echo "Path: $SRC"; echo "Filesystem: ${SFS:-unknown}"; echo; echo "$SRC_HINT"
-  if [[ $SRC_KIND == file ]]; then
-    echo "Size: $(hb "$(stat -Lc %s "$SRC" 2>/dev/null||echo 0)")"
-    have file && echo "MIME: $(file -Lb --mime-type "$SRC" 2>/dev/null||echo unknown)"
+  if have ssh && have scp; then
+    opts+=('Local backup first, then SCP result — useful for archives/images')
+    keys+=(scp-after)
   fi
-  echo; waitkey
+  c=$(choose 'Destination transport' 0 "${opts[@]}")
+  TRANSPORT=${keys[c]}
+  log "TRANSPORT selected=$TRANSPORT"
 }
 
-strategy(){
-  local -a a=() k=(); local d=0 c i
-  case $SRC_KIND in
-    block)
-      a+=('raw .img — exact block image'); k+=(img)
-      have zstd && { a+=('raw .img.zst — compressed block image'); k+=(img.zst); d=$((${#k[@]}-1)); };;
-    file)
-      a+=('rsync file copy — direct and simple'); k+=(rsync)
-      have tar && have zstd && { a+=('tar.zst — compressed file archive with Linux metadata'); k+=(tar.zst); }
-      have zip && { a+=('ZIP — Windows-friendly packaged file'); k+=(zip); }
-      if ! compressed_file && windows_target && have tar && have zstd; then for i in "${!k[@]}"; do [[ ${k[i]} == tar.zst ]]&&d=$i; done; fi;;
-    directory)
-      a+=('rsync directory — incremental and browsable'); k+=(rsync)
-      have tar && have zstd && { a+=('tar.zst — compressed directory archive'); k+=(tar.zst); }
-      have zip && { a+=('ZIP — Windows-friendly directory archive'); k+=(zip); }
-      if windows_target && have tar && have zstd; then for i in "${!k[@]}"; do [[ ${k[i]} == tar.zst ]]&&d=$i; done; fi;;
-    mountpoint)
-      a+=('rsync filesystem tree — incremental and browsable'); k+=(rsync)
-      have tar && have zstd && { a+=('tar.zst — compressed filesystem archive'); k+=(tar.zst); }
-      have zip && { a+=('ZIP — Windows-friendly, limited Linux restore fidelity'); k+=(zip); }
-      [[ $SDEV == /dev/* ]] && { a+=('raw .img — whole backing partition'); k+=(img); }
-      [[ $SDEV == /dev/* ]] && have zstd && { a+=('raw .img.zst — compressed backing partition'); k+=(img.zst); }
-      if windows_target && have tar && have zstd; then for i in "${!k[@]}"; do [[ ${k[i]} == tar.zst ]]&&d=$i; done; fi;;
-    *) echo "Unsupported source type: $SRC_KIND" >&2; return 2;;
-  esac
-  c=$(choose "Backup format for $SRC_KIND source" "$d" "${a[@]}"); STRAT=${k[c]}
-  log "STRATEGY kind=$SRC_KIND selected=$STRAT"
-  ui; echo "Source type: $SRC_KIND"; echo "Selected format: $STRAT"; echo
-  case $STRAT in
-    rsync) [[ $SRC_KIND == file ]] && echo 'The file will be copied directly; selecting a directory target places the file inside it.' || echo 'The tree remains directly browsable and efficiently updateable.';;
-    tar.zst) echo 'Creates one compressed file. Linux metadata can stay inside the archive even on NTFS/exFAT.'; compressed_file&&echo 'The source already appears compressed, so further compression may save little.';;
-    zip) echo 'Creates a Windows-friendly ZIP; Linux ACL/xattr/ownership fidelity is limited.';;
-    img*) echo 'Creates a whole-device/partition image; path exclusions do not apply.';;
-  esac
-  echo; waitkey
+ssh_target(){
+  local h=$SSH_HOST
+  [[ $h == *:* && $h != \[*\] ]] && h="[$h]"
+  printf '%s@%s' "$SSH_USER" "$h"
 }
 
-suggestname(){
-  local b s e=''; b=$([[ $SRC == / ]]&&echo linux-root||basename "$SRC"); s=$(date +%Y%m%d-%H%M%S)
-  case $STRAT in
-    rsync) [[ $SRC_KIND == file ]]&&echo "$b"||echo "$b-backup";;
-    tar.zst) e=.tar.zst;((GPG_PASS))&&e+=.gpg;echo "$b-$s$e";;
-    zip) echo "$b-$s.zip";;
-    img) echo "$b-$s.img";;
-    img.zst) e=.img.zst;((GPG_PASS))&&e+=.gpg;echo "$b-$s$e";;
-  esac
+ssh_base(){
+  local -n out=$1
+  out=(ssh -p "$SSH_PORT")
+  [[ -n $SSH_KEY ]] && out+=(-i "$SSH_KEY")
+  ((SSH_COMP)) && out+=(-C)
+  out+=("$(ssh_target)")
 }
-outask(){
-  local p=$1 d=$2 x
-  while :; do
-    x=$(ask "$p" "$d")
-    if [[ $x == /* ]]; then
-      inside "$x" "$DST" && { echo "$x"; return; }
-      ui; echo "Output must remain inside selected destination mount: $DST"; echo "Rejected: $x"; echo; waitkey
-    else echo "$DST/${x#/}"; return
+
+scp_base(){
+  local -n out=$1
+  out=(scp -P "$SSH_PORT")
+  [[ -n $SSH_KEY ]] && out+=(-i "$SSH_KEY")
+  ((SSH_COMP)) && out+=(-C)
+}
+
+network_config(){
+  local d c test_rc=0
+  local -a a sshc
+  ui
+  echo 'SSH authentication is handled by OpenSSH.'
+  echo 'Passwords/passphrases are requested interactively by ssh/scp and are never stored or logged.'
+  echo 'Existing ssh-agent and ~/.ssh/config settings remain usable.'
+  echo
+  SSH_HOST=$(ask 'Remote host / IP' "$SSH_HOST")
+  [[ -n $SSH_HOST ]] || { echo 'Remote host is required.' >&2; return 2; }
+  SSH_USER=$(ask 'Remote SSH user' "${SSH_USER:-$USER}")
+  SSH_PORT=$(ask 'SSH port' '22')
+  SSH_KEY=$(ask 'Identity file (blank = ssh-agent/config/password)' '')
+  [[ -z $SSH_KEY || -r $SSH_KEY ]] || { ui; echo "Identity file is not readable: $SSH_KEY"; waitkey; SSH_KEY=''; }
+
+  if private_host "$SSH_HOST"; then d=0; else d=1; fi
+  a=('LAN / trusted local network' 'WAN / Internet / VPN')
+  c=$(choose 'Network scope (used for recommendations only)' "$d" "${a[@]}")
+  ((c==0)) && NET_SCOPE=LAN || NET_SCOPE=WAN
+
+  REMOTE_PATH=$(ask 'Remote destination path' '~/backups/')
+  REMOTE_IS_DIR=0
+  yes 'Treat remote path as a directory?' Y && REMOTE_IS_DIR=1 || :
+
+  SSH_COMP=0
+  d=N
+  if [[ $NET_SCOPE == WAN && $TRANSPORT == rsync-ssh ]] && ! compressed_file; then d=Y; fi
+  ui
+  echo 'SSH transport compression (-C) can help text-heavy data over slow WAN links.'
+  echo 'It often wastes CPU for zstd/ZIP/media/already-compressed data and usually brings little benefit on LAN.'
+  echo
+  yes 'Enable SSH transport compression (-C)?' "$d" && SSH_COMP=1 || :
+
+  log "NETWORK scope=$NET_SCOPE transport=$TRANSPORT host=$SSH_HOST user=$SSH_USER port=$SSH_PORT key=$([[ -n $SSH_KEY ]]&&echo custom||echo default) ssh_compress=$SSH_COMP remote_path=$REMOTE_PATH remote_is_dir=$REMOTE_IS_DIR"
+
+  if yes 'Test SSH connection now? (OpenSSH may ask for password/key passphrase)' Y; then
+    ssh_base sshc
+    ui; echo "Testing SSH connection to $(ssh_target):$SSH_PORT ..."; echo
+    if "${sshc[@]}" -- true; then
+      echo 'SSH connection: OK'; log 'SSH_TEST rc=0'
+    else
+      test_rc=$?; echo "SSH connection failed (rc=$test_rc)."; log "SSH_TEST rc=$test_rc"
+      yes 'Continue anyway?' N || return "$test_rc"
     fi
-  done
-}
-altname(){
-  local p=$1 s; s=$(date +%Y%m%d-%H%M%S)
-  case $p in
-    *.tar.zst.gpg) echo "${p%.tar.zst.gpg}-$s.tar.zst.gpg";;
-    *.tar.zst) echo "${p%.tar.zst}-$s.tar.zst";;
-    *.img.zst.gpg) echo "${p%.img.zst.gpg}-$s.img.zst.gpg";;
-    *.img.zst) echo "${p%.img.zst}-$s.img.zst";;
-    *.img) echo "${p%.img}-$s.img";;
-    *.zip) echo "${p%.zip}-$s.zip";;
-    *) echo "$p-$s";;
-  esac
-}
-resolve_out(){
-  local def=$1 c fname
-  OVERWRITE=0
-  while :; do
-    OUT_KIND=$(kindof "$OUT")
-    case "$STRAT:$SRC_KIND:$OUT_KIND" in
-      rsync:file:directory|rsync:file:mountpoint)
-        ui; echo "Detected destination directory: $OUT"; echo "Suggested file: $OUT/$(basename "$SRC")"; echo
-        yes 'Place the source file inside this directory?' Y && { OUT="${OUT%/}/$(basename "$SRC")"; continue; }
-        OUT=$(outask 'Another destination path/name' "$def");;
-      rsync:file:file)
-        ui; echo "Destination file exists: $OUT"; echo 'rsync can update/replace it if the source differs.'; echo
-        c=$(choose 'Existing file' 1 'Use/update this file' 'Use a new timestamped filename' 'Enter another path/name')
-        case $c in 0)OVERWRITE=1;return;;1)OUT=$(altname "$OUT");return;;2)OUT=$(outask 'Destination path/name' "$def");;esac;;
-      rsync:directory:directory|rsync:directory:mountpoint|rsync:mountpoint:directory|rsync:mountpoint:mountpoint)
-        ui; echo "Existing destination directory: $OUT"; echo 'Suggested action: update/merge it with rsync.'; ((RSYNC_DELETE))&&echo 'WARNING: --delete is enabled.'; echo
-        yes 'Use/update this directory?' Y&&return
-        OUT=$(outask 'Another backup directory' "$def");;
-      rsync:directory:file|rsync:mountpoint:file)
-        ui; echo "A file exists where a directory is required: $OUT"; echo "Suggested: $(altname "$OUT")"; echo
-        yes 'Use the suggested new directory?' Y&&{ OUT=$(altname "$OUT");return; }
-        OUT=$(outask 'Another backup directory' "$def");;
-      *:*:directory|*:*:mountpoint)
-        fname=$(suggestname); ui; echo "Detected destination directory: $OUT"; echo "Format '$STRAT' creates a file."; echo "Suggested: $OUT/$fname"; echo
-        yes 'Create the output file inside this directory?' Y&&{ OUT="${OUT%/}/$fname";continue; }
-        OUT=$(outask 'Another output file path/name' "$def");;
-      *:*:file)
-        ui; echo "Output file already exists: $OUT"; echo 'Safe default: do not overwrite it.'; echo
-        c=$(choose 'Existing output' 1 'Overwrite existing file' 'Use a new timestamped filename' 'Enter another path/name')
-        case $c in 0)OVERWRITE=1;return;;1)OUT=$(altname "$OUT");return;;2)OUT=$(outask 'Output path/name' "$def");;esac;;
-      *:*:missing) return;;
-      *) return;;
-    esac
-  done
-}
-nameout(){
-  local d p; d=$(suggestname)
-  if [[ $STRAT == rsync && $SRC_KIND == file ]]; then p='Destination file or directory'
-  elif [[ $STRAT == rsync ]]; then p='Backup directory'
-  else p="Output file or directory for $STRAT"
+    waitkey
   fi
-  OUT=$(outask "$p" "$d"); resolve_out "$d"; OUT_KIND=$(kindof "$OUT"); [[ $OUT_KIND == missing ]]&&OUT_KIND=new
-  log "OUTPUT kind=$OUT_KIND path=$OUT overwrite=$OVERWRITE"
+
+  if ((REMOTE_IS_DIR)) && yes 'Create remote destination directory if missing?' Y; then
+    ssh_base sshc
+    "${sshc[@]}" -- mkdir -p -- "$REMOTE_PATH"
+    log 'REMOTE_MKDIR requested=1'
+  fi
+}
+
+remote_fs_probe(){
+  local -a s
+  local fs
+  ssh_base s
+  fs=$("${s[@]}" -- findmnt -T "$REMOTE_PATH" -rn -o FSTYPE 2>/dev/null | head -1 || :)
+  [[ -n $fs ]] && DFS=$fs || DFS=remote
+  DDEV="ssh:$(ssh_target)"
+  DMEDIA="NETWORK-$NET_SCOPE"
+  DLINK=0
+}
+
+remote_rsync_execute(){
+  local flags='-aS' x sshcmd dest
+  local -a args=() sshv
+  ((RSYNC_ACL)) && flags+='A'
+  ((RSYNC_XATTR)) && flags+='X'
+  ((RSYNC_HARD)) && flags+='H'
+  sshv=(ssh -p "$SSH_PORT")
+  [[ -n $SSH_KEY ]] && sshv+=(-i "$SSH_KEY")
+  ((SSH_COMP)) && sshv+=(-C)
+  sshcmd=$(q "${sshv[@]}")
+  dest="$(ssh_target):$REMOTE_PATH"
+  args=(rsync "$flags" --info=progress2 --stats -e "$sshcmd")
+  ((RSYNC_NUMID)) && args+=(--numeric-ids)
+  ((RSYNC_DELETE)) && args+=(--delete)
+  if [[ $SRC_KIND == directory || $SRC_KIND == mountpoint ]]; then
+    for x in "${EX[@]}"; do args+=(--exclude "$x"); done
+    ((SSH_COMP)) && args+=(--compress)
+    args+=("${SRC%/}/" "$dest")
+  else
+    ((SSH_COMP)) && args+=(--compress)
+    args+=("$SRC" "$dest")
+  fi
+  runlog rsync-ssh "${args[@]}"
+}
+
+scp_after_execute(){
+  local rc target
+  local -a a
+  execute_v22 || return $?
+  scp_base a
+  [[ -d $OUT ]] && a+=(-r)
+  target="$(ssh_target):$REMOTE_PATH"
+  ui
+  echo "Local backup completed. Sending result via SCP to $target"
+  echo 'OpenSSH may ask for a password/key passphrase; it is never logged.'
+  echo
+  a+=("$OUT" "$target")
+  if runlog scp-after "${a[@]}"; then rc=0; else rc=$?; fi
+  return "$rc"
 }
 
 summary(){
-  summary_v21
-  echo "Detected source object: $SRC_KIND"
-  echo "Detected/planned output object: $OUT_KIND"
-  echo "Output overwrite/update approved: $([[ $OVERWRITE == 1 ]]&&echo yes||echo no)"
-  echo "Suggestion: $SRC_HINT"
+  summary_v22
+  echo "Transport: $TRANSPORT"
+  if [[ $TRANSPORT != local ]]; then
+    echo "Network scope: $NET_SCOPE"
+    echo "SSH target: $(ssh_target):$SSH_PORT"
+    echo "Remote path: $REMOTE_PATH ($([[ $REMOTE_IS_DIR == 1 ]]&&echo directory||echo exact-path))"
+    echo "SSH compression: $([[ $SSH_COMP == 1 ]]&&echo yes||echo no)"
+    echo "SSH identity: $([[ -n $SSH_KEY ]]&&echo custom-key||echo agent/config/password)"
+    [[ $TRANSPORT == rsync-ssh ]] && echo 'Local output path: not used — transfer is direct'
+    [[ $TRANSPORT == scp-after ]] && echo 'Transfer order: create local backup first, then SCP the result'
+  fi
   echo
 }
 
-execute_file(){
-  local sudo= need=0 flags p sp sn; local -a a=()
-  [[ ! -w $DST ]]&&need=1; ((need))&&priv; ((EUID!=0&&need))&&sudo='sudo -n '
-  mkdir -p "$(dirname "$OUT")" 2>/dev/null||$sudo mkdir -p "$(dirname "$OUT")"
-  case $STRAT in
-    rsync)
-      flags='-aS';((RSYNC_ACL))&&flags+='A';((RSYNC_XATTR))&&flags+='X';((RSYNC_HARD))&&flags+='H'
-      a=(rsync "$flags" --info=progress2 --stats);((RSYNC_NUMID))&&a+=(--numeric-ids);a+=("$SRC" "$OUT")
-      ((EUID!=0&&need))&&runlog rsync-file sudo -n "${a[@]}"||runlog rsync-file "${a[@]}";;
-    tar.zst)
-      ((OVERWRITE))&&rm -f -- "$OUT";sp=$(dirname "$SRC");sn=$(basename "$SRC")
-      a=(tar -C "$sp" -cpf -);((TAR_META))&&a=(tar --acls --xattrs --numeric-owner -C "$sp" -cpf -)
-      p="${sudo}$(q "${a[@]}") $(printf %q "$sn") | zstd -q -$ZLVL -T$ZTH -c"
-      if ((GPG_PASS));then export GPG_TTY="$(tty 2>/dev/null||:)";runshell tar-file-gpg "$p | gpg --symmetric --cipher-algo AES256 --output $(printf %q "$OUT")";else runshell tar-file "$p > $(printf %q "$OUT")";fi;;
-    zip)
-      ((OVERWRITE))&&rm -f -- "$OUT";sp=$(dirname "$SRC");sn=$(basename "$SRC");a=(zip "-$ZIP_LEVEL");((ZIP_PASS))&&a+=(-e);((ZIP_SPLIT))&&a+=(-s "$ZIP_SPLIT_SIZE");a+=("$OUT" "$sn")
-      (cd "$sp"&&runlog zip-file "${a[@]}");;
+execute(){
+  case $TRANSPORT in
+    local) execute_v22;;
+    rsync-ssh) remote_rsync_execute;;
+    scp-after) scp_after_execute;;
   esac
 }
-execute(){
-  if [[ $SRC_KIND == file ]]; then execute_file; return; fi
-  if ((OVERWRITE))&&[[ $STRAT != rsync && -e $OUT ]];then
-    if [[ -w $(dirname "$OUT") ]];then rm -f -- "$OUT";else priv;sudo -n rm -f -- "$OUT";fi
-  fi
-  mkdir -p "$(dirname "$OUT")" 2>/dev/null||:
-  execute_v21
-}
-
-self(){ [[ $(iosize 480) -ge 67108864 && $(iosize 10000) -eq 1073741824 ]];[[ $(kindof /) == mountpoint ]];echo 'self-test: OK'; }
 
 main(){
-  [[ ${1:-} == --self-test ]]&&{ self;return; };[[ -t 0 && -t 1 ]]||{ echo 'TTY required';exit 1;};tput civis 2>/dev/null||:
-  local rq;rq=$(ask 'Source file or directory' /);[[ -e $rq || -b $rq ]]||{ ui;echo "Source does not exist: $rq";waitkey;return 2;};SRC=$(real "$rq");SRC_KIND=$(kindof "$SRC")
-  if [[ $SRC_KIND == block ]];then SDEV=$SRC;SFS=$(lsblk -ndo FSTYPE "$SRC" 2>/dev/null|head -1);SFS=${SFS:-unknown};else read -r _ SDEV SFS _ <<<"$(mountinfo "$SRC")";fi
-  SMEDIA=$(media "$SDEV" "$SFS");SLINK=$(linkmb "$SDEV");explain;source_info
-  choose_dst;[[ -d $DST && $(findmnt -T "$DST" -rn -o TARGET) == "$DST" ]]||{ echo 'Destination must be a mountpoint';exit 2;};read -r _ DDEV DFS _ <<<"$(mountinfo "$DST")";DMEDIA=$(media "$DDEV" "$DFS");DLINK=$(linkmb "$DDEV")
-  log "SRC=$SRC KIND=$SRC_KIND DEV=$SDEV FS=$SFS MEDIA=$SMEDIA LINK=$SLINK";log "DST=$DST DEV=$DDEV FS=$DFS MEDIA=$DMEDIA LINK=$DLINK"
-  if [[ $SRC_KIND == directory || $SRC_KIND == mountpoint ]];then base_ex;mount_selector;else EX=();fi
-  yes 'Run safe zstd CPU benchmark in tmpfs?' Y&&cpu_bench||:;yes 'Run destination I/O benchmark with temporary file?' N&&io_bench||:
-  strategy;format_options;home_root;passwords;nameout;summary
-  yes 'Confirmation 1/2: Is this plan correct?' N||return;yes 'Confirmation 2/2: Are you SURE you want to start?' N||return
-  local r;if execute;then r=0;else r=$?;fi;ui;((r==0))&&echo "Backup completed. Output: $OUT"||echo "Backup failed rc=$r";echo "Log: $LOG";return "$r"
+  [[ ${1:-} == --self-test ]] && { self; private_host 192.168.1.2; ! private_host 8.8.8.8; echo 'network self-test: OK'; return; }
+  [[ -t 0 && -t 1 ]] || { echo 'TTY required'; exit 1; }
+  tput civis 2>/dev/null||:
+  local rq r
+  rq=$(ask 'Source file or directory' /)
+  [[ -e $rq || -b $rq ]] || { ui; echo "Source does not exist: $rq"; waitkey; return 2; }
+  SRC=$(real "$rq"); SRC_KIND=$(kindof "$SRC")
+  if [[ $SRC_KIND == block ]]; then
+    SDEV=$SRC; SFS=$(lsblk -ndo FSTYPE "$SRC" 2>/dev/null|head -1); SFS=${SFS:-unknown}
+  else
+    read -r _ SDEV SFS _ <<<"$(mountinfo "$SRC")"
+  fi
+  SMEDIA=$(media "$SDEV" "$SFS"); SLINK=$(linkmb "$SDEV")
+  explain; source_info
+  transport_choose
+
+  if [[ $TRANSPORT == rsync-ssh ]]; then
+    network_config || return $?
+    remote_fs_probe
+    DST='/__remote_destination__'
+    log "SRC=$SRC KIND=$SRC_KIND DEV=$SDEV FS=$SFS MEDIA=$SMEDIA LINK=$SLINK"
+    log "DST_REMOTE=$(ssh_target):$REMOTE_PATH FS=$DFS MEDIA=$DMEDIA"
+    if [[ $SRC_KIND == directory || $SRC_KIND == mountpoint ]]; then base_ex; mount_selector; else EX=(); fi
+    yes 'Run safe zstd CPU benchmark in tmpfs?' N && cpu_bench || :
+    STRAT=rsync
+    ui
+    echo 'Direct network mode selected: rsync over SSH.'
+    echo 'The transfer is incremental and does not require a local staging backup.'
+    echo 'Archive/image formats are available through the Local backup → SCP mode instead.'
+    echo; waitkey
+    format_options
+    SIDE=(); ZIP_PASS=0; GPG_PASS=0
+    OUT="$(ssh_target):$REMOTE_PATH"; OUT_KIND=remote
+  else
+    choose_dst
+    [[ -d $DST && $(findmnt -T "$DST" -rn -o TARGET) == "$DST" ]] || { echo 'Destination must be a mountpoint'; exit 2; }
+    read -r _ DDEV DFS _ <<<"$(mountinfo "$DST")"
+    DMEDIA=$(media "$DDEV" "$DFS"); DLINK=$(linkmb "$DDEV")
+    log "SRC=$SRC KIND=$SRC_KIND DEV=$SDEV FS=$SFS MEDIA=$SMEDIA LINK=$SLINK"
+    log "DST=$DST DEV=$DDEV FS=$DFS MEDIA=$DMEDIA LINK=$DLINK"
+    if [[ $SRC_KIND == directory || $SRC_KIND == mountpoint ]]; then base_ex; mount_selector; else EX=(); fi
+    yes 'Run safe zstd CPU benchmark in tmpfs?' Y && cpu_bench || :
+    yes 'Run destination I/O benchmark with temporary file?' N && io_bench || :
+    strategy; format_options; home_root; passwords; nameout
+    if [[ $TRANSPORT == scp-after ]]; then network_config || return $?; fi
+  fi
+
+  summary
+  yes 'Confirmation 1/2: Is this plan correct?' N || return
+  yes 'Confirmation 2/2: Are you SURE you want to start?' N || return
+  if execute; then r=0; else r=$?; fi
+  ui
+  if ((r==0)); then
+    [[ $TRANSPORT == rsync-ssh ]] && echo "Network backup completed: $(ssh_target):$REMOTE_PATH" || echo "Backup completed. Output: $OUT"
+  else
+    echo "Backup failed rc=$r"
+  fi
+  echo "Log: $LOG"
+  return "$r"
 }
-log "START app=$APP ver=$VER uid=$UID bash=$BASH_VERSION";main "$@"
+
+log "START app=$APP ver=$VER uid=$UID bash=$BASH_VERSION"
+main "$@"
