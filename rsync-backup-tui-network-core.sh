@@ -3,21 +3,15 @@ set -Eeuo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CORE="$HERE/rsync-backup-tui-object-core.sh"
 [[ -r $CORE ]] || { echo "Missing object-aware core: $CORE" >&2; exit 1; }
-
-# Load v2.2 without executing its final main call.
 source <(sed '$d' "$CORE")
 VER='2.3'
-
 eval "$(declare -f summary | sed '1s/^summary /summary_v22 /')"
 eval "$(declare -f execute | sed '1s/^execute /execute_v22 /')"
-
-TRANSPORT=local
-NET_SCOPE=LAN
+TRANSPORT=local; NET_SCOPE=LAN
 SSH_HOST=''; SSH_USER="${USER:-}"; SSH_PORT=22; SSH_KEY=''; SSH_COMP=0
 REMOTE_PATH='~/backups/'; REMOTE_IS_DIR=1
-
-private_host(){ local h=${1,,}; [[ $h == localhost || $h == *.local || $h == 127.* || $h == 10.* || $h == 192.168.* ]]&&return 0; [[ $h =~ ^172\.([1][6-9]|2[0-9]|3[01])\. ]]&&return 0; [[ $h == ::1 || $h == fc*:* || $h == fd*:* || $h == fe80:* ]]&&return 0; return 1; }
-transport_choose(){ local -a opts keys; local c; opts=('Local mounted storage — current behavior');keys=(local);if have ssh&&have rsync&&[[ $SRC_KIND != block ]];then opts+=('Direct rsync over SSH — recommended for LAN/WAN incremental copy');keys+=(rsync-ssh);fi;if have ssh&&have scp;then opts+=('Local backup first, then SCP result — useful for archives/images');keys+=(scp-after);fi;c=$(choose 'Destination transport' 0 "${opts[@]}");TRANSPORT=${keys[c]};log "TRANSPORT selected=$TRANSPORT"; }
+private_host(){ local h=${1,,};[[ $h == localhost || $h == *.local || $h == 127.* || $h == 10.* || $h == 192.168.* ]]&&return 0;[[ $h =~ ^172\.([1][6-9]|2[0-9]|3[01])\. ]]&&return 0;[[ $h == ::1 || $h == fc*:* || $h == fd*:* || $h == fe80:* ]]&&return 0;return 1; }
+transport_choose(){ local -a opts keys;local c;opts=('Local mounted storage — current behavior');keys=(local);if have ssh&&have rsync&&[[ $SRC_KIND != block ]];then opts+=('Direct rsync over SSH — recommended for LAN/WAN incremental copy');keys+=(rsync-ssh);fi;if have ssh&&have scp;then opts+=('Local backup first, then SCP result — useful for archives/images');keys+=(scp-after);fi;c=$(choose 'Destination transport' 0 "${opts[@]}");TRANSPORT=${keys[c]};log "TRANSPORT selected=$TRANSPORT"; }
 ssh_target(){ local h=$SSH_HOST;[[ $h == *:* && $h != \[*\] ]]&&h="[$h]";printf '%s@%s' "$SSH_USER" "$h"; }
 ssh_base(){ local -n out=$1;out=(ssh -p "$SSH_PORT");[[ -n $SSH_KEY ]]&&out+=(-i "$SSH_KEY");((SSH_COMP))&&out+=(-C);out+=("$(ssh_target)"); }
 scp_base(){ local -n out=$1;out=(scp -P "$SSH_PORT");[[ -n $SSH_KEY ]]&&out+=(-i "$SSH_KEY");((SSH_COMP))&&out+=(-C); }
