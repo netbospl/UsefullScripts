@@ -1,63 +1,276 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-APP='Linux Backup TUI'; VER='2.0'; PREF='/run/media/netbos/ext4HDD'
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/linux-backup-tui"; mkdir -p "$STATE"
-LOG="$STATE/session-$(date +%Y%m%d-%H%M%S)-$$.log"; :>"$LOG"
-SRC=/; DST=; OUT=; STRAT=rsync; SFS=; DFS=; SDEV=; DDEV=; SMEDIA=; DMEDIA=; SLINK=0; DLINK=0
-CPU1=0; CPUALL=0; IOW=0; IOR=0; IOSZ=0; ZIP_PASS=0; GPG_PASS=0; ZLVL=3; ZTH=0
-EX=(); SIDE=(); MT=(); MS=(); MF=(); MO=(); MM=(); MX=(); ML=(); MR=()
-log(){ printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG"; }
-q(){ local a=() x; for x; do printf -v x '%q' "$x"; a+=("$x"); done; printf '%s' "${a[*]}"; }
-clean(){ tput cnorm 2>/dev/null||:; stty sane 2>/dev/null||:; }
-err(){ local r=$?; log "ERROR rc=$r line=${BASH_LINENO[0]:-?} fn=${FUNCNAME[1]:-main} cmd=$(printf %q "${BASH_COMMAND:-?}")"; clean; echo "Error. Log: $LOG" >&2; exit "$r"; }
-trap err ERR; trap 'log INTERRUPTED; clean; exit 130' INT TERM; trap 'r=$?; log "EXIT rc=$r"; clean' EXIT
-have(){ command -v "$1" >/dev/null 2>&1; }; for c in findmnt lsblk rsync awk sed grep dd df mktemp; do have "$c"||{ echo "Missing: $c"; exit 1; }; done
-hb(){ awk -v n="${1:-0}" 'BEGIN{split("B KiB MiB GiB TiB",u);i=1;while(n>=1024&&i<5){n/=1024;i++}printf(i==1?"%d %s":"%.1f %s",n,u[i])}'; }
-real(){ readlink -f -- "$1" 2>/dev/null||printf %s "$1"; }
-inside(){ local a b; a=$(real "$1"); b=$(real "$2"); [[ $a == "$b" || $a == "$b"/* ]]; }
-ui(){ clear; printf '\033[1m%s\033[0m  v%s\n%s\n' "$APP" "$VER" '────────────────────────────────────────────────────────────────────────────'; }
-ask(){ local p=$1 d=${2:-} x; read -r -e -p "$p [$d]: " x; printf %s "${x:-$d}"; }
-yes(){ local p=$1 d=${2:-N} x; while :; do read -r -p "$p [$d]: " x; x=${x:-$d}; case ${x,,} in y|yes|t|tak)return 0;;n|no|nie)return 1;;esac; done; }
-waitkey(){ read -r -p 'Press Enter to continue...' _; }
-choose(){ local title=$1 def=$2; shift 2; local a=("$@") i x; while :; do ui; echo "$title"; echo; for i in "${!a[@]}"; do printf ' %2d) %s%s\n' "$((i+1))" "${a[i]}" "$([[ $i == $def ]]&&echo '  [recommended]')"; done; read -r -p "Choice [$((def+1))]: " x; x=${x:-$((def+1))}; [[ $x =~ ^[0-9]+$ ]]&&((x>=1&&x<=${#a[@]}))&&{ echo $((x-1)); return; }; done; }
-rootdisk(){ local d=${1%%\[*} p; [[ $d == /dev/* ]]||return; d=$(real "$d"); while p=$(lsblk -ndo PKNAME "$d" 2>/dev/null)&&[[ $p ]]; do d=/dev/$p; done; echo "$d"; }
-media(){ local s=$1 f=$2 d r t n; case $f in tmpfs|devtmpfs|proc|sysfs|cgroup*|configfs|debugfs|tracefs|securityfs|autofs)echo VIRTUAL;return;;fuse.*)echo FUSE;return;;esac; [[ $f =~ ^(nfs|cifs|smb|sshfs|9p) ]]&&{ echo NETWORK;return; }; [[ $s == /dev/* ]]||{ echo "${f^^}";return; }; d=$(rootdisk "$s"); r=$(lsblk -ndo ROTA "$d" 2>/dev/null||echo ?); t=$(lsblk -ndo TRAN "$d" 2>/dev/null|tr A-Z a-z); n=${d##*/}; [[ $n == nvme* ]]&&{ echo 'NVMe SSD';return; }; [[ $n == mmcblk* ]]&&{ echo 'SD/eMMC';return; }; [[ $t == usb ]]&&{ [[ $r == 1 ]]&&echo 'USB HDD'||echo 'USB SSD/flash';return; }; [[ $t =~ ^(sata|ata)$ ]]&&{ [[ $r == 1 ]]&&echo 'SATA HDD'||echo 'SATA SSD';return; }; [[ $r == 1 ]]&&echo HDD||echo SSD; }
-linkmb(){ local s=$1 d t p v; [[ $s == /dev/* ]]||{ echo 0;return; }; d=$(rootdisk "$s"); t=$(lsblk -ndo TRAN "$d" 2>/dev/null|tr A-Z a-z); p=$(readlink -f "/sys/class/block/${d##*/}/device" 2>/dev/null||:); if [[ $t == usb ]]; then while [[ $p != / && $p ]]; do [[ -r $p/speed ]]&&{ v=$(<$p/speed); awk -v x="$v" 'BEGIN{printf "%d",x}';return; };p=${p%/*};done;echo 5000; elif [[ $t =~ ^(sata|ata)$ ]];then while [[ $p != / && $p ]];do [[ -r $p/sata_spd ]]&&{ v=$(<$p/sata_spd); [[ $v == *1.5* ]]&&echo 1500||[[ $v == *3.0* ]]&&echo 3000||echo 6000;return;};p=${p%/*};done;echo 6000; elif [[ ${d##*/} == nvme* ]];then echo 6000;else echo 0;fi; }
-mountinfo(){ findmnt -T "$1" -rn -o TARGET,SOURCE,FSTYPE,OPTIONS; }
-scan(){ MT=();MS=();MF=();MO=();MM=(); while IFS=$'\t' read -r t s f o;do MT+=("$t");MS+=("$s");MF+=("$f");MO+=("$o");MM+=("$(media "$s" "$f")");done < <(findmnt -rn -P -o TARGET,SOURCE,FSTYPE,OPTIONS|sed -E 's/TARGET="([^"]*)" SOURCE="([^"]*)" FSTYPE="([^"]*)" OPTIONS="([^"]*)"/\1\t\2\t\3\t\4/'); }
-choose_dst(){ scan; local a=() ix=() i free def=0 c; for i in "${!MT[@]}";do [[ ${MT[i]} == / || ,${MO[i]}, != *,rw,* ]]&&continue; [[ ${MM[i]} =~ ^(VIRTUAL|FUSE)$ ]]&&continue; free=$(df -B1 --output=avail "${MT[i]}"|tail -1|tr -d ' ');a+=("${MT[i]} [${MS[i]}, ${MF[i]}, ${MM[i]}, $(hb "$free") free]");ix+=("$i");[[ ${MT[i]} == "$PREF" ]]&&def=$((${#a[@]}-1));done;a+=('Custom mounted path');c=$(choose 'Destination' "$def" "${a[@]}"); if ((c==${#a[@]}-1));then DST=$(ask 'Mountpoint' "$PREF");else DST=${MT[${ix[c]}]};fi; }
-fs_ex(){ case $SFS in btrfs)EX+=("/.snapshots/***" "/timeshift/***" "/.timeshift/***" "/var/lib/snapper/***");;ntfs|ntfs3|fuseblk)EX+=("/\$RECYCLE.BIN/***" "/System Volume Information/***" "/pagefile.sys" "/hiberfil.sys" "/swapfile.sys" "/Windows/Temp/***");;exfat|vfat)EX+=("/System Volume Information/***" "/\$RECYCLE.BIN/***" "/.Spotlight-V100/***" "/.Trashes/***" "/Thumbs.db");;esac; }
-base_ex(){ EX=("/dev/***" "/proc/***" "/sys/***" "/run/***" "/tmp/***" "/mnt/***" "/media/***" "/var/cache/***" "/var/tmp/***" "/var/log/journal/***" "/var/lib/systemd/coredump/***" "/home/*/.cache/***" "/home/*/.local/share/Trash/***" "/root/.cache/***" "/lost+found" "/swapfile");fs_ex; }
-explain(){ ui; echo "Source FS: $SFS ($SDEV)";echo;case $SFS in btrfs)echo 'Btrfs: snapshots (.snapshots/Timeshift/Snapper) are excluded by default to avoid expanding reflinked history on non-Btrfs targets.';;ext4|xfs|f2fs)echo 'Linux filesystem: rsync to ext4/Btrfs/XFS can preserve UID/GID, modes, ACLs and xattrs.';;ntfs*|fuseblk)echo 'NTFS source: Windows transient files (pagefile, hiberfil, recycle bin) are excluded.';;exfat|vfat)echo 'Portable filesystem: removable-media metadata is excluded; Linux ACL/xattr semantics are limited.';;esac;echo;waitkey; }
-mount_selector(){ scan; MX=();ML=();MR=();local i sd md;sd=$(rootdisk "$SDEV");for i in "${!MT[@]}";do if ! inside "${MT[i]}" "$SRC"||[[ $(real "${MT[i]}") == $(real "$SRC") ]];then MX+=(2);ML+=(1);MR+=(outside);elif [[ $(real "${MT[i]}") == $(real "$DST") ]];then MX+=(1);ML+=(1);MR+=(destination);elif [[ ${MM[i]} == VIRTUAL ]];then MX+=(1);ML+=(1);MR+=(runtime);else md=$(rootdisk "${MS[i]}");if [[ $md && $md == "$sd" ]];then MX+=(0);ML+=(0);MR+=(same-disk);else MX+=(1);ML+=(0);MR+=(other-mount);fi;fi;done;local ids=() x n;for i in "${!MT[@]}";do ((MX[i]==2))||ids+=("$i");done;while :;do ui;echo 'Mounted paths inside source: [X]=exclude [!]=mandatory';echo;for n in "${!ids[@]}";do i=${ids[n]};printf ' %2d) [%s] %-28s %-14s %s\n' "$((n+1))" "$([[ ${ML[i]} == 1 ]]&&echo !||[[ ${MX[i]} == 1 ]]&&echo X||echo ' ')" "${MT[i]}" "${MM[i]}" "${MR[i]}";done;read -r -p 'Toggle number, or Enter to accept: ' x;[[ -z $x ]]&&break;[[ $x =~ ^[0-9]+$ ]]&&((x>=1&&x<=${#ids[@]}))&&{ i=${ids[x-1]};((ML[i]))||MX[i]=$((1-MX[i]));};done;for i in "${ids[@]}";do if ((MX[i]));then x=$(real "${MT[i]}");x=${x#"$(real "$SRC")"};[[ $x ]]&&EX+=("/${x#/}/***");fi;done; }
-tmpfs(){ local p;for p in /dev/shm "/run/user/$UID" /tmp;do [[ -w $p && $(findmnt -T "$p" -rn -o FSTYPE 2>/dev/null) == tmpfs ]]&&{ echo "$p";return;};done;return 1; }
-cpu_bench(){ have zstd||{ log 'CPU_BENCH skip no-zstd';return;};local t m f n r z t1 t2;t=$(tmpfs)||{ log 'CPU_BENCH skip no-tmpfs';return;};m=$(awk '/MemAvailable:/{print $2}' /proc/meminfo);n=64;((m<6*1024*1024))&&n=32;((m>16*1024*1024))&&n=128;f=$(mktemp "$t/backup-bench.XXXX");r=$((n/4));z=$((n-r));dd if=/dev/zero of="$f" bs=1M count="$z" status=none;((r))&&dd if=/dev/urandom of="$f" bs=1M count="$r" seek="$z" conv=notrunc status=none;t1=$(date +%s%N);zstd -q -3 -T1 -c "$f">/dev/null;t2=$(date +%s%N);CPU1=$(awk -v m="$n" -v d=$((t2-t1)) 'BEGIN{printf "%.1f",m/(d/1e9)}');t1=$(date +%s%N);zstd -q -3 -T0 -c "$f">/dev/null;t2=$(date +%s%N);CPUALL=$(awk -v m="$n" -v d=$((t2-t1)) 'BEGIN{printf "%.1f",m/(d/1e9)}');rm -f "$f";log "CPU_BENCH sample=$n 1t=$CPU1 all=$CPUALL";ui;echo "zstd L3: 1T $CPU1 MiB/s | all threads $CPUALL MiB/s";waitkey; }
-iosize(){ local x=${1:-1000};((x<=0))&&x=1000;((x>6000))&&x=6000;local b=$((x*1000000/8*3/2));((b<64*1024*1024))&&b=$((64*1024*1024));((b>1024*1024*1024))&&b=$((1024*1024*1024));echo "$b"; }
-io_bench(){ local l=$DLINK free f a b ns;l=${l:-0};((SLINK>0&&(l==0||SLINK<l)))&&l=$SLINK;IOSZ=$(iosize "$l");free=$(df -B1 --output=avail "$DST"|tail -1|tr -d ' ');((IOSZ>free/20))&&IOSZ=$((free/20));((IOSZ<32*1024*1024))&&return;f="$DST/.backup-io-$$";:>"$f";[[ $DFS == btrfs ]]&&have chattr&&chattr +C "$f" 2>/dev/null||:;a=$(date +%s%N);dd if=/dev/zero of="$f" bs=4M count=$((IOSZ/4194304)) conv=fdatasync status=none;b=$(date +%s%N);ns=$((b-a));IOW=$(awk -v s="$IOSZ" -v n="$ns" 'BEGIN{printf "%.1f",(s/1048576)/(n/1e9)}');a=$(date +%s%N);dd if="$f" of=/dev/null bs=4M iflag=direct status=none 2>/dev/null||dd if="$f" of=/dev/null bs=4M status=none;b=$(date +%s%N);ns=$((b-a));IOR=$(awk -v s="$IOSZ" -v n="$ns" 'BEGIN{printf "%.1f",(s/1048576)/(n/1e9)}');rm -f "$f";log "IO_BENCH size=$IOSZ write=$IOW read=$IOR";ui;echo "I/O: write $IOW MiB/s | read $IOR MiB/s | sample $(hb "$IOSZ")";waitkey; }
-strategy(){ local a=('rsync directory — incremental; best Linux restore fidelity') k=(rsync) d=0 c i;have tar&&have zstd&&{ a+=('tar.zst — compressed archive; preserves Linux metadata inside archive');k+=(tar.zst);};have zip&&{ a+=('ZIP — Windows friendly; weaker Linux metadata fidelity');k+=(zip);};[[ $SDEV == /dev/* ]]&&{ a+=('raw .img — full block image; ignores exclusions');k+=(img);have zstd&&{ a+=('raw .img.zst — compressed block image');k+=(img.zst);};};[[ $DFS =~ ^(ntfs|ntfs3|fuseblk|exfat|vfat)$ ]]&&for i in "${!k[@]}";do [[ ${k[i]} == tar.zst ]]&&d=$i;done;c=$(choose 'Backup format' "$d" "${a[@]}");STRAT=${k[c]};ui;case $STRAT in rsync)echo 'rsync: browsable + incremental; Linux metadata best on ext4/Btrfs/XFS.';;tar.zst)echo 'tar.zst: compressed single file; useful on NTFS/exFAT because Linux metadata stays inside archive.';;zip)echo 'ZIP: easiest on Windows; not a faithful Linux system restore format.';;img*)echo 'IMG: block-level image; exclusions and Btrfs snapshot filtering do not apply.';;esac;waitkey; }
-passwords(){ ZIP_PASS=0;GPG_PASS=0;case $STRAT in zip)yes 'Encrypt ZIP with password? zip will prompt securely and password is never logged.' N&&ZIP_PASS=1;;tar.zst|img.zst)if have gpg&&yes 'Encrypt final file with GPG symmetric password?' N;then GPG_PASS=1;fi;;esac; }
-priv(){ ((EUID==0))&&return;have sudo||return 1;ui;echo 'sudo will ask for its password directly. The script never reads or logs it.';log SUDO_REQUEST;sudo -v;log SUDO_OK; }
-runlog(){ local n=$1 r;shift;log "OP_START $n";log "CMD $(q "$@")";if "$@"> >(tee -a "$LOG") 2>&1;then r=0;else r=$?;fi;log "OP_END $n rc=$r";return "$r"; }
-runshell(){ local n=$1 c=$2 r;log "OP_START $n";log "CMD $c";if bash -o pipefail -c "$c"> >(tee -a "$LOG") 2>&1;then r=0;else r=$?;fi;log "OP_END $n rc=$r";return "$r"; }
-tarex(){ local x p;for x in "${EX[@]}";do p=${x#/};p=${p%/\*\*\*};printf ' --exclude=%q' "./$p";done; }
-home_root(){ SIDE=();[[ $STRAT == tar.zst && $DFS =~ ^(btrfs|ext[234]|xfs|f2fs)$ && $SRC == / ]]||return;if ! yes 'Compress /home inside tar.zst? No = separate uncompressed rsync copy.' Y;then EX+=("/home/***");SIDE+=(/home);fi;if ! yes 'Compress /root inside tar.zst? No = separate uncompressed rsync copy.' Y;then EX+=("/root/***");SIDE+=(/root);fi; }
-nameout(){ local b s e=;b=$([[ $SRC == / ]]&&echo linux-root||basename "$SRC");s=$(date +%Y%m%d-%H%M%S);case $STRAT in rsync)OUT="$DST/$(ask 'Backup directory' "$b-backup")";;tar.zst)e=.tar.zst;((GPG_PASS))&&e+=.gpg;OUT="$DST/$(ask 'Output filename' "$b-$s$e")";;zip)OUT="$DST/$(ask 'Output filename' "$b-$s.zip")";;img)OUT="$DST/$(ask 'Output filename' "$b-$s.img")";;img.zst)e=.img.zst;((GPG_PASS))&&e+=.gpg;OUT="$DST/$(ask 'Output filename' "$b-$s$e")";;esac; }
-summary(){ ui;cat <<EOF
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CORE="$HERE/rsync-backup-tui-bash-core.sh"
+[[ -r "$CORE" ]] || { echo "Missing core: $CORE" >&2; exit 1; }
+# Load the previous stable implementation without executing its final main call.
+# The wrapper below overrides only format-aware choices, summary and execution.
+source <(sed '$d' "$CORE")
+VER='2.1'
+
+RSYNC_ACL=1; RSYNC_XATTR=1; RSYNC_HARD=1; RSYNC_NUMID=1; RSYNC_DELETE=0
+TAR_META=1
+ZIP_LEVEL=6; ZIP_SPLIT=0; ZIP_SPLIT_SIZE='3900m'
+IMG_LIVE_OK=0
+
+linux_target(){ [[ $DFS =~ ^(btrfs|ext[234]|xfs|f2fs)$ ]]; }
+windows_target(){ [[ $DFS =~ ^(ntfs|ntfs3|fuseblk|exfat|vfat)$ ]]; }
+
+format_options(){
+  local c a=()
+  ui
+  echo "Selected format: $STRAT"
+  echo
+  case $STRAT in
+    rsync)
+      echo 'rsync keeps files directly browsable and supports efficient incremental reruns.'
+      if linux_target; then
+        echo 'Linux target detected: ACLs, xattrs, numeric ownership and hard links can be preserved faithfully.'
+      else
+        echo "Target filesystem: $DFS"
+        echo 'Windows/portable filesystems cannot faithfully represent every Linux ACL/xattr/UID/GID.'
+        echo 'For a Linux system backup on NTFS/exFAT, tar.zst is usually safer because metadata stays inside the archive.'
+      fi
+      echo
+      waitkey
+      RSYNC_ACL=0; RSYNC_XATTR=0; RSYNC_HARD=0; RSYNC_NUMID=0; RSYNC_DELETE=0
+      yes 'Preserve ACLs (-A)?' "$([[ $(linux_target; echo $?) == 0 ]]&&echo Y||echo N)" && RSYNC_ACL=1 || :
+      yes 'Preserve extended attributes/xattrs (-X)?' "$([[ $(linux_target; echo $?) == 0 ]]&&echo Y||echo N)" && RSYNC_XATTR=1 || :
+      yes 'Preserve hard links (-H)?' Y && RSYNC_HARD=1 || :
+      yes 'Preserve numeric UID/GID (--numeric-ids)?' "$([[ $(linux_target; echo $?) == 0 ]]&&echo Y||echo N)" && RSYNC_NUMID=1 || :
+      ui
+      echo 'Optional mirror mode:'
+      echo '  --delete removes destination files that no longer exist in the source.'
+      echo '  It is useful for an exact mirror, but it can destroy older backup-only files.'
+      echo
+      yes 'Enable destructive mirror deletions (--delete)?' N && RSYNC_DELETE=1 || :
+      ;;
+    tar.zst)
+      echo 'tar.zst stores a Linux-aware tar archive and compresses it with parallel zstd.'
+      echo 'ACLs, xattrs, owners and permissions can remain inside the archive even when the destination is NTFS/exFAT.'
+      echo 'Unlike rsync, it is not directly incremental and individual files require archive extraction.'
+      if [[ $SFS == btrfs ]]; then
+        echo 'Btrfs snapshots remain excluded by the source rules unless you explicitly re-add them.'
+      fi
+      echo
+      waitkey
+      TAR_META=0
+      yes 'Store Linux ACLs, xattrs and numeric ownership in the tar archive?' Y && TAR_META=1 || :
+      a=('Level 1 — fastest / least compression' 'Level 3 — balanced [recommended]' 'Level 6 — stronger compression / more CPU' 'Level 9 — high compression / slower')
+      c=$(choose 'zstd compression level' 1 "${a[@]}")
+      case $c in 0) ZLVL=1;; 1) ZLVL=3;; 2) ZLVL=6;; 3) ZLVL=9;; esac
+      ;;
+    zip)
+      echo 'ZIP prioritizes Windows compatibility and convenient file-by-file access.'
+      echo 'It is NOT a faithful Linux system-restore format: ACLs, xattrs, device files and Unix ownership are limited.'
+      [[ $DFS == vfat ]] && echo 'FAT32/VFAT detected: files larger than 4 GiB are not supported, so split ZIP is strongly recommended.'
+      echo
+      waitkey
+      a=('Store only (-0) — no compression' 'Fast (-1)' 'Balanced (-6) [recommended]' 'Maximum (-9)')
+      c=$(choose 'ZIP compression level' 2 "${a[@]}")
+      case $c in 0) ZIP_LEVEL=0;; 1) ZIP_LEVEL=1;; 2) ZIP_LEVEL=6;; 3) ZIP_LEVEL=9;; esac
+      ZIP_SPLIT=0
+      if [[ $DFS == vfat ]]; then
+        yes 'Split ZIP into ~3.9 GiB parts for FAT32 compatibility?' Y && ZIP_SPLIT=1 || :
+      elif yes 'Create a split ZIP archive (useful for removable media / transfer)?' N; then
+        ZIP_SPLIT=1
+        ZIP_SPLIT_SIZE=$(ask 'ZIP split size, e.g. 1900m or 3900m' '3900m')
+      fi
+      ;;
+    img|img.zst)
+      echo 'IMG is a block-level image of the entire backing partition/device.'
+      echo 'Filesystem exclusions, cache filters and Btrfs snapshot exclusions DO NOT apply: every allocated/unallocated block is represented.'
+      echo 'A live mounted read/write filesystem can change during imaging and therefore produce an inconsistent image.'
+      echo
+      waitkey
+      IMG_LIVE_OK=0
+      if findmnt -rn -S "${SDEV%%\[*}" >/dev/null 2>&1; then
+        yes 'Source block device appears mounted. Continue with a live image anyway?' N && IMG_LIVE_OK=1 || {
+          echo 'Image mode cancelled because live block imaging was not confirmed.'
+          waitkey
+          strategy
+          format_options
+          return
+        }
+      else
+        IMG_LIVE_OK=1
+      fi
+      if [[ $STRAT == img.zst ]]; then
+        a=('Level 1 — fastest' 'Level 3 — balanced [recommended]' 'Level 6 — stronger compression' 'Level 9 — high compression')
+        c=$(choose 'zstd compression level for image' 1 "${a[@]}")
+        case $c in 0) ZLVL=1;; 1) ZLVL=3;; 2) ZLVL=6;; 3) ZLVL=9;; esac
+      fi
+      ;;
+  esac
+  log "FORMAT_OPTIONS strat=$STRAT rsync_acl=$RSYNC_ACL rsync_xattr=$RSYNC_XATTR rsync_hard=$RSYNC_HARD rsync_numid=$RSYNC_NUMID rsync_delete=$RSYNC_DELETE tar_meta=$TAR_META zip_level=$ZIP_LEVEL zip_split=$ZIP_SPLIT zstd_level=$ZLVL"
+}
+
+summary(){
+  ui
+  cat <<EOF
 FINAL PLAN
 Source: $SRC | $SDEV | $SFS | $SMEDIA | ${SLINK} Mb/s
 Destination: $DST | $DDEV | $DFS | $DMEDIA | ${DLINK} Mb/s
 Strategy: $STRAT
 Output: $OUT
-ZIP password: $([[ $ZIP_PASS == 1 ]]&&echo yes||echo no)
-GPG password: $([[ $GPG_PASS == 1 ]]&&echo yes||echo no)
 CPU zstd: 1T=$CPU1 MiB/s all=$CPUALL MiB/s
 I/O: write=$IOW MiB/s read=$IOR MiB/s sample=$(hb "$IOSZ")
 Separate rsync: ${SIDE[*]:-none}
 Log: $LOG
-Exclusions:
 EOF
-printf '  %s\n' "${EX[@]}";echo; }
-execute(){ local sudo= need=0 x p dir tgt args dev;[[ $SRC == / || $STRAT == img* || ! -w $DST ]]&&need=1;((need))&&priv;((EUID!=0&&need))&&sudo='sudo -n ';case $STRAT in rsync)mkdir -p "$OUT" 2>/dev/null||$sudo mkdir -p "$OUT";args=(rsync -aAXHS --numeric-ids --info=progress2 --stats);for x in "${EX[@]}";do args+=(--exclude "$x");done;args+=("${SRC%/}/" "${OUT%/}/");((EUID!=0&&need))&&runlog rsync sudo -n "${args[@]}"||runlog rsync "${args[@]}";;tar.zst)p="${sudo}tar --acls --xattrs --numeric-owner -C $(printf %q "$SRC") -cpf -$(tarex) . | zstd -q -$ZLVL -T$ZTH -c";if ((GPG_PASS));then export GPG_TTY="$(tty 2>/dev/null||:)";ui;echo 'GPG/pinentry will ask for the passphrase; it is never logged.';waitkey;runshell tar_zst_gpg "$p | gpg --symmetric --cipher-algo AES256 --output $(printf %q "$OUT")";else runshell tar_zst "$p > $(printf %q "$OUT")";fi;;zip)args=(zip -r);((ZIP_PASS))&&args+=(-e);args+=("$OUT" .);for x in "${EX[@]}";do p=${x#/};p=${p%/\*\*\*};args+=(-x "$p" "$p/*");done;ui;((ZIP_PASS))&&echo 'zip will ask for the password twice; it is never logged.';log "ZIP_ENCRYPTED=$ZIP_PASS";(cd "$SRC"&&runlog zip "${args[@]}");;img)dev=${SDEV%%\[*};runshell img "${sudo}dd if=$(printf %q "$dev") of=$(printf %q "$OUT") bs=16M status=progress conv=fsync";;img.zst)dev=${SDEV%%\[*};p="${sudo}dd if=$(printf %q "$dev") bs=16M status=progress | zstd -q -$ZLVL -T$ZTH -c";if ((GPG_PASS));then export GPG_TTY="$(tty 2>/dev/null||:)";runshell img_zst_gpg "$p | gpg --symmetric --cipher-algo AES256 --output $(printf %q "$OUT")";else runshell img_zst "$p > $(printf %q "$OUT")";fi;;esac; if((${#SIDE[@]}));then dir="$OUT.uncompressed";$sudo mkdir -p "$dir";for p in "${SIDE[@]}";do tgt="$dir/${p#/}";$sudo mkdir -p "$tgt";args=(rsync -aAXHS --numeric-ids --info=progress2 --stats "${p%/}/" "${tgt%/}/");((EUID!=0&&need))&&runlog side-rsync sudo -n "${args[@]}"||runlog side-rsync "${args[@]}";done;fi; }
-self(){ [[ $(iosize 480) -ge 67108864 && $(iosize 10000) -eq 1073741824 ]];echo 'self-test: OK'; }
-main(){ [[ ${1:-} == --self-test ]]&&{ self;return;};[[ -t 0 && -t 1 ]]||{ echo 'TTY required';exit 1;};tput civis 2>/dev/null||:;SRC=$(real "$(ask 'Source' /)");read -r _ SDEV SFS _ <<<"$(mountinfo "$SRC")";SMEDIA=$(media "$SDEV" "$SFS");SLINK=$(linkmb "$SDEV");explain;choose_dst;[[ -d $DST && $(findmnt -T "$DST" -rn -o TARGET) == "$DST" ]]||{ echo 'Destination must be a mountpoint';exit 2;};read -r _ DDEV DFS _ <<<"$(mountinfo "$DST")";DMEDIA=$(media "$DDEV" "$DFS");DLINK=$(linkmb "$DDEV");log "SRC=$SRC DEV=$SDEV FS=$SFS MEDIA=$SMEDIA LINK=$SLINK";log "DST=$DST DEV=$DDEV FS=$DFS MEDIA=$DMEDIA LINK=$DLINK";base_ex;mount_selector;yes 'Run safe zstd CPU benchmark in tmpfs?' Y&&cpu_bench||:;yes 'Run destination I/O benchmark with temporary file?' N&&io_bench||:;strategy;if [[ $STRAT == tar.zst || $STRAT == img.zst ]];then local n c a;n=$(nproc 2>/dev/null||echo 1);a=("All threads ($n)" "Half threads ($((n>1?n/2:1)))" 'Single thread');c=$(choose 'zstd parallelism' 0 "${a[@]}");case $c in 0)ZTH=0;;1)ZTH=$((n>1?n/2:1));;2)ZTH=1;;esac;fi;home_root;passwords;nameout;summary;yes 'Confirmation 1/2: Is this plan correct?' N||return;yes 'Confirmation 2/2: Are you SURE you want to start?' N||return;local r;if execute;then r=0;else r=$?;fi;ui;((r==0))&&echo "Backup completed. Output: $OUT"||echo "Backup failed rc=$r";echo "Log: $LOG";return "$r"; }
-log "START app=$APP ver=$VER uid=$UID bash=$BASH_VERSION";main "$@"
+  case $STRAT in
+    rsync)
+      cat <<EOF
+rsync options:
+  preserve ACLs:          $([[ $RSYNC_ACL == 1 ]]&&echo yes||echo no)
+  preserve xattrs:        $([[ $RSYNC_XATTR == 1 ]]&&echo yes||echo no)
+  preserve hard links:    $([[ $RSYNC_HARD == 1 ]]&&echo yes||echo no)
+  preserve numeric IDs:   $([[ $RSYNC_NUMID == 1 ]]&&echo yes||echo no)
+  delete destination extras: $([[ $RSYNC_DELETE == 1 ]]&&echo YES||echo no)
+EOF
+      ;;
+    tar.zst)
+      cat <<EOF
+tar.zst options:
+  Linux metadata: $([[ $TAR_META == 1 ]]&&echo ACL/xattr/numeric-owner||echo basic-mode-only)
+  zstd level: $ZLVL
+  zstd threads: $([[ $ZTH == 0 ]]&&echo all||echo "$ZTH")
+  GPG encryption: $([[ $GPG_PASS == 1 ]]&&echo yes||echo no)
+EOF
+      ;;
+    zip)
+      cat <<EOF
+ZIP options:
+  compression level: $ZIP_LEVEL
+  password encryption: $([[ $ZIP_PASS == 1 ]]&&echo yes||echo no)
+  split archive: $([[ $ZIP_SPLIT == 1 ]]&&echo "$ZIP_SPLIT_SIZE"||echo no)
+  Linux metadata fidelity: limited
+EOF
+      ;;
+    img|img.zst)
+      cat <<EOF
+Image options:
+  raw block image: yes
+  live mounted source confirmed: $([[ $IMG_LIVE_OK == 1 ]]&&echo yes||echo no)
+  exclusions applied: NO
+EOF
+      [[ $STRAT == img.zst ]] && printf '  zstd level: %s\n  zstd threads: %s\n  GPG encryption: %s\n' "$ZLVL" "$([[ $ZTH == 0 ]]&&echo all||echo "$ZTH")" "$([[ $GPG_PASS == 1 ]]&&echo yes||echo no)"
+      ;;
+  esac
+  echo
+  echo 'Exclusions:'
+  printf '  %s\n' "${EX[@]}"
+  echo
+}
+
+execute(){
+  local sudo= need=0 x p dir tgt dev flags tarflags=() zipargs=()
+  local -a args=()
+  [[ $SRC == / || $STRAT == img* || ! -w $DST ]] && need=1
+  ((need)) && priv
+  ((EUID!=0&&need)) && sudo='sudo -n '
+  case $STRAT in
+    rsync)
+      mkdir -p "$OUT" 2>/dev/null || $sudo mkdir -p "$OUT"
+      flags='-aS'
+      ((RSYNC_ACL)) && flags+='A'
+      ((RSYNC_XATTR)) && flags+='X'
+      ((RSYNC_HARD)) && flags+='H'
+      args=(rsync "$flags" --info=progress2 --stats)
+      ((RSYNC_NUMID)) && args+=(--numeric-ids)
+      ((RSYNC_DELETE)) && args+=(--delete)
+      for x in "${EX[@]}"; do args+=(--exclude "$x"); done
+      args+=("${SRC%/}/" "${OUT%/}/")
+      ((EUID!=0&&need)) && runlog rsync sudo -n "${args[@]}" || runlog rsync "${args[@]}"
+      ;;
+    tar.zst)
+      tarflags=(tar -C "$SRC" -cpf -)
+      if ((TAR_META)); then tarflags=(tar --acls --xattrs --numeric-owner -C "$SRC" -cpf -); fi
+      p="${sudo}$(q "${tarflags[@]}")$(tarex) . | zstd -q -$ZLVL -T$ZTH -c"
+      if ((GPG_PASS)); then
+        export GPG_TTY="$(tty 2>/dev/null||:)"
+        ui; echo 'GPG/pinentry will ask for the passphrase; it is never logged.'; waitkey
+        runshell tar_zst_gpg "$p | gpg --symmetric --cipher-algo AES256 --output $(printf %q "$OUT")"
+      else
+        runshell tar_zst "$p > $(printf %q "$OUT")"
+      fi
+      ;;
+    zip)
+      zipargs=(zip -r "-$ZIP_LEVEL")
+      ((ZIP_PASS)) && zipargs+=(-e)
+      ((ZIP_SPLIT)) && zipargs+=(-s "$ZIP_SPLIT_SIZE")
+      zipargs+=("$OUT" .)
+      for x in "${EX[@]}"; do p=${x#/}; p=${p%/\*\*\*}; zipargs+=(-x "$p" "$p/*"); done
+      ui; ((ZIP_PASS)) && echo 'zip will ask for the password twice; it is never logged.'
+      log "ZIP_ENCRYPTED=$ZIP_PASS ZIP_LEVEL=$ZIP_LEVEL ZIP_SPLIT=$ZIP_SPLIT"
+      (cd "$SRC" && runlog zip "${zipargs[@]}")
+      ;;
+    img)
+      dev=${SDEV%%\[*}
+      runshell img "${sudo}dd if=$(printf %q "$dev") of=$(printf %q "$OUT") bs=16M status=progress conv=fsync"
+      ;;
+    img.zst)
+      dev=${SDEV%%\[*}
+      p="${sudo}dd if=$(printf %q "$dev") bs=16M status=progress | zstd -q -$ZLVL -T$ZTH -c"
+      if ((GPG_PASS)); then
+        export GPG_TTY="$(tty 2>/dev/null||:)"
+        runshell img_zst_gpg "$p | gpg --symmetric --cipher-algo AES256 --output $(printf %q "$OUT")"
+      else
+        runshell img_zst "$p > $(printf %q "$OUT")"
+      fi
+      ;;
+  esac
+  if ((${#SIDE[@]})); then
+    dir="$OUT.uncompressed"; $sudo mkdir -p "$dir"
+    for p in "${SIDE[@]}"; do
+      tgt="$dir/${p#/}"; $sudo mkdir -p "$tgt"
+      args=(rsync -aAXHS --numeric-ids --info=progress2 --stats "${p%/}/" "${tgt%/}/")
+      ((EUID!=0&&need)) && runlog side-rsync sudo -n "${args[@]}" || runlog side-rsync "${args[@]}"
+    done
+  fi
+}
+
+main(){
+  [[ ${1:-} == --self-test ]] && { self; return; }
+  [[ -t 0 && -t 1 ]] || { echo 'TTY required'; exit 1; }
+  tput civis 2>/dev/null||:
+  SRC=$(real "$(ask 'Source' /)")
+  read -r _ SDEV SFS _ <<<"$(mountinfo "$SRC")"
+  SMEDIA=$(media "$SDEV" "$SFS"); SLINK=$(linkmb "$SDEV")
+  explain
+  choose_dst
+  [[ -d $DST && $(findmnt -T "$DST" -rn -o TARGET) == "$DST" ]] || { echo 'Destination must be a mountpoint'; exit 2; }
+  read -r _ DDEV DFS _ <<<"$(mountinfo "$DST")"
+  DMEDIA=$(media "$DDEV" "$DFS"); DLINK=$(linkmb "$DDEV")
+  log "SRC=$SRC DEV=$SDEV FS=$SFS MEDIA=$SMEDIA LINK=$SLINK"
+  log "DST=$DST DEV=$DDEV FS=$DFS MEDIA=$DMEDIA LINK=$DLINK"
+  base_ex
+  mount_selector
+  yes 'Run safe zstd CPU benchmark in tmpfs?' Y && cpu_bench || :
+  yes 'Run destination I/O benchmark with temporary file?' N && io_bench || :
+  strategy
+  if [[ $STRAT == tar.zst || $STRAT == img.zst ]]; then
+    local n c; local -a a
+    n=$(nproc 2>/dev/null||echo 1)
+    a=("All threads ($n)" "Half threads ($((n>1?n/2:1)))" 'Single thread')
+    c=$(choose 'zstd parallelism' 0 "${a[@]}")
+    case $c in 0) ZTH=0;; 1) ZTH=$((n>1?n/2:1));; 2) ZTH=1;; esac
+  fi
+  format_options
+  home_root
+  passwords
+  nameout
+  summary
+  yes 'Confirmation 1/2: Is this plan correct?' N || return
+  yes 'Confirmation 2/2: Are you SURE you want to start?' N || return
+  local r
+  if execute; then r=0; else r=$?; fi
+  ui
+  ((r==0)) && echo "Backup completed. Output: $OUT" || echo "Backup failed rc=$r"
+  echo "Log: $LOG"
+  return "$r"
+}
+
+log "START app=$APP ver=$VER uid=$UID bash=$BASH_VERSION"
+main "$@"
