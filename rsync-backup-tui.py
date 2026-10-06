@@ -9,6 +9,8 @@ assert spec and spec.loader
 sys.modules[spec.name]=core
 spec.loader.exec_module(core)
 import backup_tui_enhancements as enh
+import backup_tui_policy as policy
+policy.apply(enh)
 if __name__=='__main__':
     if '--self-test' in sys.argv:
         raise SystemExit(0 if enh.selftest() else 1)
