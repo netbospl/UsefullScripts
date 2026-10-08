@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HERE="${BACKUP_TUI_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 CORE="$HERE/rsync-backup-tui-object-core.sh"
 [[ -r $CORE ]] || { echo "Missing object-aware core: $CORE" >&2; exit 1; }
 source <(sed '$d' "$CORE")
@@ -11,11 +11,110 @@ TRANSPORT=local; NET_SCOPE=LAN
 SSH_HOST=''; SSH_USER="${USER:-}"; SSH_PORT=22; SSH_KEY=''; SSH_COMP=0
 REMOTE_PATH='~/backups/'; REMOTE_IS_DIR=1
 private_host(){ local h=${1,,};[[ $h == localhost || $h == *.local || $h == 127.* || $h == 10.* || $h == 192.168.* ]]&&return 0;[[ $h =~ ^172\.([1][6-9]|2[0-9]|3[01])\. ]]&&return 0;[[ $h == ::1 || $h == fc*:* || $h == fd*:* || $h == fe80:* ]]&&return 0;return 1; }
-transport_choose(){ local -a opts keys;local c;opts=('Local mounted storage — current behavior');keys=(local);if have ssh&&have rsync&&[[ $SRC_KIND != block ]];then opts+=('Direct rsync over SSH — recommended for LAN/WAN incremental copy');keys+=(rsync-ssh);fi;if have ssh&&have scp;then opts+=('Local backup first, then SCP result — useful for archives/images');keys+=(scp-after);fi;c=$(choose 'Destination transport' 0 "${opts[@]}");TRANSPORT=${keys[c]};log "TRANSPORT selected=$TRANSPORT"; }
+transport_choose(){
+  local -a opts keys
+  local c
+  opts=('Local mounted storage — includes local disks and mounted NFS')
+  keys=(local)
+  if have ssh && have rsync && [[ $SRC_KIND != block ]]; then
+    opts+=('Direct rsync over SSH — recommended for incremental LAN/WAN backup')
+    keys+=(rsync-ssh)
+  fi
+  if have ssh && have scp; then
+    opts+=('Local backup first, then SCP result — good for archives/images')
+    keys+=(scp-after)
+  fi
+  if have sftp; then
+    opts+=('Local backup first, then SFTP upload — interactive SSH/SFTP destination')
+    keys+=(sftp-after)
+  fi
+  choose 'Destination transport' 0 "${opts[@]}"
+  c=$CHOOSE_RESULT
+  TRANSPORT=${keys[c]}
+  log "TRANSPORT selected=$TRANSPORT"
+}
 ssh_target(){ local h=$SSH_HOST;[[ $h == *:* && $h != \[*\] ]]&&h="[$h]";printf '%s@%s' "$SSH_USER" "$h"; }
 ssh_base(){ local -n out=$1;out=(ssh -p "$SSH_PORT");[[ -n $SSH_KEY ]]&&out+=(-i "$SSH_KEY");((SSH_COMP))&&out+=(-C);out+=("$(ssh_target)"); }
 scp_base(){ local -n out=$1;out=(scp -P "$SSH_PORT");[[ -n $SSH_KEY ]]&&out+=(-i "$SSH_KEY");((SSH_COMP))&&out+=(-C); }
-network_config(){ local d c test_rc=0;local -a a sshc;ui;echo 'SSH authentication is handled by OpenSSH.';echo 'Passwords/passphrases are requested interactively by ssh/scp and are never stored or logged.';echo 'Existing ssh-agent and ~/.ssh/config settings remain usable.';echo;SSH_HOST=$(ask 'Remote host / IP' "$SSH_HOST");[[ -n $SSH_HOST ]]||{ echo 'Remote host is required.' >&2;return 2; };SSH_USER=$(ask 'Remote SSH user' "${SSH_USER:-$USER}");SSH_PORT=$(ask 'SSH port' '22');SSH_KEY=$(ask 'Identity file (blank = ssh-agent/config/password)' '');[[ -z $SSH_KEY || -r $SSH_KEY ]]||{ ui;echo "Identity file is not readable: $SSH_KEY";waitkey;SSH_KEY=''; };if private_host "$SSH_HOST";then d=0;else d=1;fi;a=('LAN / trusted local network' 'WAN / Internet / VPN');c=$(choose 'Network scope (used for recommendations only)' "$d" "${a[@]}");((c==0))&&NET_SCOPE=LAN||NET_SCOPE=WAN;REMOTE_PATH=$(ask 'Remote destination path' '~/backups/');REMOTE_IS_DIR=0;yes 'Treat remote path as a directory?' Y&&REMOTE_IS_DIR=1||:;SSH_COMP=0;d=N;if [[ $NET_SCOPE == WAN && $TRANSPORT == rsync-ssh ]]&&! compressed_file;then d=Y;fi;ui;echo 'SSH transport compression (-C) can help text-heavy data over slow WAN links.';echo 'It often wastes CPU for zstd/ZIP/media/already-compressed data and usually brings little benefit on LAN.';echo;yes 'Enable SSH transport compression (-C)?' "$d"&&SSH_COMP=1||:;log "NETWORK scope=$NET_SCOPE transport=$TRANSPORT host=$SSH_HOST user=$SSH_USER port=$SSH_PORT key=$([[ -n $SSH_KEY ]]&&echo custom||echo default) ssh_compress=$SSH_COMP remote_path=$REMOTE_PATH remote_is_dir=$REMOTE_IS_DIR";if yes 'Test SSH connection now? (OpenSSH may ask for password/key passphrase)' Y;then ssh_base sshc;ui;echo "Testing SSH connection to $(ssh_target):$SSH_PORT ...";echo;if "${sshc[@]}" -- true;then echo 'SSH connection: OK';log 'SSH_TEST rc=0';else test_rc=$?;echo "SSH connection failed (rc=$test_rc).";log "SSH_TEST rc=$test_rc";yes 'Continue anyway?' N||return "$test_rc";fi;waitkey;fi;if ((REMOTE_IS_DIR))&&yes 'Create remote destination directory if missing?' Y;then ssh_base sshc;"${sshc[@]}" -- mkdir -p -- "$REMOTE_PATH";log 'REMOTE_MKDIR requested=1';fi; }
+network_config(){ local d c test_rc=0;local -a a sshc;ui;echo 'SSH authentication is handled by OpenSSH.';echo 'Passwords/passphrases are requested interactively by ssh/scp and are never stored or logged.';echo 'Existing ssh-agent and ~/.ssh/config settings remain usable.';echo;SSH_HOST=$(ask 'Remote host / IP' "$SSH_HOST");[[ -n $SSH_HOST ]]||{ echo 'Remote host is required.' >&2;return 2; };SSH_USER=$(ask 'Remote SSH user' "${SSH_USER:-$USER}");SSH_PORT=$(ask 'SSH port' '22');SSH_KEY=$(ask 'Identity file (blank = ssh-agent/config/password)' '');[[ -z $SSH_KEY || -r $SSH_KEY ]]||{ ui;echo "Identity file is not readable: $SSH_KEY";waitkey;SSH_KEY=''; };if private_host "$SSH_HOST";then d=0;else d=1;fi;a=('LAN / trusted local network' 'WAN / Internet / VPN');choose 'Network scope (used for recommendations only)' "$d" "${a[@]}";c=$CHOOSE_RESULT;((c==0))&&NET_SCOPE=LAN||NET_SCOPE=WAN;REMOTE_PATH=$(ask 'Remote destination path' '~/backups/');REMOTE_IS_DIR=0;yes 'Treat remote path as a directory?' Y&&REMOTE_IS_DIR=1||:;SSH_COMP=0;d=N;if [[ $NET_SCOPE == WAN && $TRANSPORT == rsync-ssh ]]&&! compressed_file;then d=Y;fi;ui;echo 'SSH transport compression (-C) can help text-heavy data over slow WAN links.';echo 'It often wastes CPU for zstd/ZIP/media/already-compressed data and usually brings little benefit on LAN.';echo;yes 'Enable SSH transport compression (-C)?' "$d"&&SSH_COMP=1||:;log "NETWORK scope=$NET_SCOPE transport=$TRANSPORT host=$SSH_HOST user=$SSH_USER port=$SSH_PORT key=$([[ -n $SSH_KEY ]]&&echo custom||echo default) ssh_compress=$SSH_COMP remote_path=$REMOTE_PATH remote_is_dir=$REMOTE_IS_DIR";if yes 'Test SSH connection now? (OpenSSH may ask for password/key passphrase)' Y;then ssh_base sshc;ui;echo "Testing SSH connection to $(ssh_target):$SSH_PORT ...";echo;if "${sshc[@]}" -- true;then echo 'SSH connection: OK';log 'SSH_TEST rc=0';else test_rc=$?;echo "SSH connection failed (rc=$test_rc).";log "SSH_TEST rc=$test_rc";yes 'Continue anyway?' N||return "$test_rc";fi;waitkey;fi;if ((REMOTE_IS_DIR))&&yes 'Create remote destination directory if missing?' Y;then ssh_base sshc;"${sshc[@]}" -- mkdir -p -- "$REMOTE_PATH";log 'REMOTE_MKDIR requested=1';fi; }
+nfs_probe(){
+  local info target source fstype options
+  DST_IS_NFS=0; NFS_SOURCE=''; NFS_FSTYPE=''
+  info=$(findmnt -T "$DST" -rn -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null || :)
+  [[ -n $info ]] || return
+  read -r target source fstype options <<<"$info"
+  case $fstype in
+    nfs|nfs4)
+      DST_IS_NFS=1; NFS_SOURCE=$source; NFS_FSTYPE=$fstype
+      DMEDIA='NFS mount'; DLINK=0
+      ui
+      echo 'Mounted NFS destination detected.'
+      echo
+      echo "Mountpoint: $target"
+      echo "Remote export: $source"
+      echo "Filesystem: $fstype"
+      echo
+      echo 'This path behaves like a local directory, but I/O includes the network and remote storage.'
+      echo 'An I/O benchmark measures the complete NFS path, not just a disk.'
+      echo 'Raw .img mode is not inferred from an NFS mount because it is not a local block device.'
+      echo
+      waitkey
+      log "NFS_DETECTED target=$target source=$source fstype=$fstype options=$options"
+      ;;
+  esac
+}
+
+remote_mounts(){
+  local target source fstype
+  while read -r target source fstype; do
+    case $fstype in nfs|nfs4|cifs|smb3|sshfs|9p|ceph|glusterfs|davfs|fuse.sshfs|fuse.rclone|fuse.davfs)
+      printf '%b\t%b\t%b\n' "$target" "$source" "$fstype";;
+    esac
+  done < <(findmnt -rn -o TARGET,SOURCE,FSTYPE 2>/dev/null || :)
+}
+
+critical_mounts(){
+  local mp target reason
+  for mp in / /home /boot /boot/efi /efi /var /usr /etc; do
+    [[ -d $mp ]] || continue
+    target=$(findmnt -rn -T "$mp" -o TARGET 2>/dev/null|head -1)
+    [[ -n $target ]] || continue
+    [[ $SRC == "$target" || $SRC == "$target/"* || $target == "$SRC/"* ]] && continue
+    reason="$mp is on $target, outside selected source $SRC"
+    if [[ -n $reason ]]; then ui; printf 'SAFETY CHECK: %s\nContinuing could omit critical system data.\n' "$reason"; log "CRITICAL_MOUNT_WARNING $reason"; yes 'Continue despite this critical mount not being backed up?' N || return 1; reason=; fi
+  done
+  return 0
+}
+
+offer_remote_unmount(){
+  local mounts target source fstype rc
+  mounts=$(remote_mounts)
+  [[ -n $mounts ]] || return 0
+  ui
+  echo 'Mounted remote filesystems detected:'
+  while IFS=$'\t' read -r target source fstype; do printf '  %s — %s (%s)\n' "$target" "$source" "$fstype"; done <<<"$mounts"
+  echo 'Unmounting may interrupt applications using these paths or make remote data temporarily unavailable.'
+  echo 'Nothing will be unmounted unless you confirm twice for that mount.'
+  echo
+  while IFS=$'\t' read -r target source fstype; do
+    if yes "Unmount $target ($source, $fstype)? This may disrupt open files and network services." N && yes "FINAL confirmation: unmount exactly $target from $source?" N; then
+      if umount -- "$target" >>"$LOG" 2>&1; then
+        log "REMOTE_UMOUNT target=$target fstype=$fstype rc=0"
+        continue
+      else
+        rc=$?
+      fi
+      if ((EUID != 0)) && have sudo && sudo umount -- "$target" >>"$LOG" 2>&1; then
+        log "REMOTE_UMOUNT target=$target fstype=$fstype via=sudo rc=0"
+      else
+        rc=$?
+        log "REMOTE_UMOUNT target=$target fstype=$fstype rc=$rc"
+        printf 'Could not unmount %s (exit %s); it was left mounted. See log: %s\n' "$target" "$rc" "$LOG" >&2
+      fi
+    fi
+  done <<<"$mounts"
+}
+
 remote_fs_probe(){ local -a s;local fs;ssh_base s;fs=$("${s[@]}" -- findmnt -T "$REMOTE_PATH" -rn -o FSTYPE 2>/dev/null|head -1||:);[[ -n $fs ]]&&DFS=$fs||DFS=remote;DDEV="ssh:$(ssh_target)";DMEDIA="NETWORK-$NET_SCOPE";DLINK=0; }
 remote_rsync_execute(){ local flags='-aS' x sshcmd dest;local -a args=() sshv;((RSYNC_ACL))&&flags+='A';((RSYNC_XATTR))&&flags+='X';((RSYNC_HARD))&&flags+='H';sshv=(ssh -p "$SSH_PORT");[[ -n $SSH_KEY ]]&&sshv+=(-i "$SSH_KEY");((SSH_COMP))&&sshv+=(-C);sshcmd=$(q "${sshv[@]}");dest="$(ssh_target):$REMOTE_PATH";args=(rsync "$flags" --info=progress2 --stats -e "$sshcmd");((RSYNC_NUMID))&&args+=(--numeric-ids);((RSYNC_DELETE))&&args+=(--delete);if [[ $SRC_KIND == directory || $SRC_KIND == mountpoint ]];then for x in "${EX[@]}";do args+=(--exclude "$x");done;((SSH_COMP))&&args+=(--compress);args+=("${SRC%/}/" "$dest");else ((SSH_COMP))&&args+=(--compress);args+=("$SRC" "$dest");fi;runlog rsync-ssh "${args[@]}"; }
 scp_after_execute(){ local rc target;local -a a;execute_v22||return $?;scp_base a;[[ -d $OUT ]]&&a+=(-r);target="$(ssh_target):$REMOTE_PATH";ui;echo "Local backup completed. Sending result via SCP to $target";echo 'OpenSSH may ask for a password/key passphrase; it is never logged.';echo;a+=("$OUT" "$target");if runlog scp-after "${a[@]}";then rc=0;else rc=$?;fi;return "$rc"; }

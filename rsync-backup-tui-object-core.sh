@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HERE="${BACKUP_TUI_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 BASE="$HERE/rsync-backup-tui-bash-core.sh"
 PREV="$HERE/rsync-backup-tui-format-core.sh"
 [[ -r $BASE && -r $PREV ]] || { echo "Missing backup TUI core files in $HERE" >&2; exit 1; }
@@ -28,6 +28,7 @@ kindof(){
   [[ -L $p ]] && echo symlink || echo missing
 }
 compressed_file(){ [[ $SRC_KIND == file && ${SRC,,} =~ \.(zip|7z|rar|gz|bz2|xz|zst|lz4|jpg|jpeg|png|gif|webp|avif|heic|mp3|aac|ogg|opus|flac|mp4|mkv|webm|mov|avi|pdf|apk|iso)$ ]]; }
+archive_target(){ windows_target || [[ ${DMEDIA:-} == NETWORK || ${DMEDIA:-} == 'NFS mount' || ${DMEDIA:-} == FUSE ]]; }
 
 source_info(){
   SRC_KIND=$(kindof "$SRC")
@@ -59,22 +60,22 @@ strategy(){
       a+=('rsync file copy — direct and simple'); k+=(rsync)
       have tar && have zstd && { a+=('tar.zst — compressed file archive with Linux metadata'); k+=(tar.zst); }
       have zip && { a+=('ZIP — Windows-friendly packaged file'); k+=(zip); }
-      if ! compressed_file && windows_target && have tar && have zstd; then for i in "${!k[@]}"; do [[ ${k[i]} == tar.zst ]]&&d=$i; done; fi;;
+      if ! compressed_file && archive_target && have tar && have zstd; then for i in "${!k[@]}"; do [[ ${k[i]} == tar.zst ]]&&d=$i; done; fi;;
     directory)
       a+=('rsync directory — incremental and browsable'); k+=(rsync)
       have tar && have zstd && { a+=('tar.zst — compressed directory archive'); k+=(tar.zst); }
       have zip && { a+=('ZIP — Windows-friendly directory archive'); k+=(zip); }
-      if windows_target && have tar && have zstd; then for i in "${!k[@]}"; do [[ ${k[i]} == tar.zst ]]&&d=$i; done; fi;;
+      if archive_target && have tar && have zstd; then for i in "${!k[@]}"; do [[ ${k[i]} == tar.zst ]]&&d=$i; done; fi;;
     mountpoint)
       a+=('rsync filesystem tree — incremental and browsable'); k+=(rsync)
       have tar && have zstd && { a+=('tar.zst — compressed filesystem archive'); k+=(tar.zst); }
       have zip && { a+=('ZIP — Windows-friendly, limited Linux restore fidelity'); k+=(zip); }
       [[ $SDEV == /dev/* ]] && { a+=('raw .img — whole backing partition'); k+=(img); }
       [[ $SDEV == /dev/* ]] && have zstd && { a+=('raw .img.zst — compressed backing partition'); k+=(img.zst); }
-      if windows_target && have tar && have zstd; then for i in "${!k[@]}"; do [[ ${k[i]} == tar.zst ]]&&d=$i; done; fi;;
+      if archive_target && have tar && have zstd; then for i in "${!k[@]}"; do [[ ${k[i]} == tar.zst ]]&&d=$i; done; fi;;
     *) echo "Unsupported source type: $SRC_KIND" >&2; return 2;;
   esac
-  c=$(choose "Backup format for $SRC_KIND source" "$d" "${a[@]}"); STRAT=${k[c]}
+  choose "Backup format for $SRC_KIND source" "$d" "${a[@]}"; c=$CHOOSE_RESULT; STRAT=${k[c]}
   log "STRATEGY kind=$SRC_KIND selected=$STRAT"
   ui; echo "Source type: $SRC_KIND"; echo "Selected format: $STRAT"; echo
   case $STRAT in
@@ -131,7 +132,7 @@ resolve_out(){
         OUT=$(outask 'Another destination path/name' "$def");;
       rsync:file:file)
         ui; echo "Destination file exists: $OUT"; echo 'rsync can update/replace it if the source differs.'; echo
-        c=$(choose 'Existing file' 1 'Use/update this file' 'Use a new timestamped filename' 'Enter another path/name')
+        choose 'Existing file' 1 'Use/update this file' 'Use a new timestamped filename' 'Enter another path/name'; c=$CHOOSE_RESULT
         case $c in 0)OVERWRITE=1;return;;1)OUT=$(altname "$OUT");return;;2)OUT=$(outask 'Destination path/name' "$def");;esac;;
       rsync:directory:directory|rsync:directory:mountpoint|rsync:mountpoint:directory|rsync:mountpoint:mountpoint)
         ui; echo "Existing destination directory: $OUT"; echo 'Suggested action: update/merge it with rsync.'; ((RSYNC_DELETE))&&echo 'WARNING: --delete is enabled.'; echo
@@ -147,7 +148,7 @@ resolve_out(){
         OUT=$(outask 'Another output file path/name' "$def");;
       *:*:file)
         ui; echo "Output file already exists: $OUT"; echo 'Safe default: do not overwrite it.'; echo
-        c=$(choose 'Existing output' 1 'Overwrite existing file' 'Use a new timestamped filename' 'Enter another path/name')
+        choose 'Existing output' 1 'Overwrite existing file' 'Use a new timestamped filename' 'Enter another path/name'; c=$CHOOSE_RESULT
         case $c in 0)OVERWRITE=1;return;;1)OUT=$(altname "$OUT");return;;2)OUT=$(outask 'Output path/name' "$def");;esac;;
       *:*:missing) return;;
       *) return;;

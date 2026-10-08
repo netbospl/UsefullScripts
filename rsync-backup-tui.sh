@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BACKUP_TUI_DIR=$HERE
 CORE="$HERE/rsync-backup-tui-network-core.sh"
 [[ -r $CORE ]] || { echo "Missing network-aware core: $CORE" >&2; exit 1; }
 
@@ -16,56 +17,17 @@ DST_IS_NFS=0
 NFS_SOURCE=''
 NFS_FSTYPE=''
 
-transport_choose(){
-  local -a opts keys
-  local c
-  opts=('Local mounted storage — includes local disks and mounted NFS')
-  keys=(local)
-  if have ssh && have rsync && [[ $SRC_KIND != block ]]; then
-    opts+=('Direct rsync over SSH — recommended for incremental LAN/WAN backup')
-    keys+=(rsync-ssh)
-  fi
-  if have ssh && have scp; then
-    opts+=('Local backup first, then SCP result — good for archives/images')
-    keys+=(scp-after)
-  fi
-  if have sftp; then
-    opts+=('Local backup first, then SFTP upload — interactive SSH/SFTP destination')
-    keys+=(sftp-after)
-  fi
-  c=$(choose 'Destination transport' 0 "${opts[@]}")
-  TRANSPORT=${keys[c]}
-  log "TRANSPORT selected=$TRANSPORT"
-}
+choose_dst(){ choose_dst_v23; }
 
-nfs_probe(){
-  local info target source fstype options
-  DST_IS_NFS=0; NFS_SOURCE=''; NFS_FSTYPE=''
-  info=$(findmnt -T "$DST" -rn -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null || :)
-  [[ -n $info ]] || return
-  read -r target source fstype options <<<"$info"
-  case $fstype in
-    nfs|nfs4)
-      DST_IS_NFS=1; NFS_SOURCE=$source; NFS_FSTYPE=$fstype
-      DMEDIA='NFS mount'; DLINK=0
-      ui
-      echo 'Mounted NFS destination detected.'
-      echo
-      echo "Mountpoint: $target"
-      echo "Remote export: $source"
-      echo "Filesystem: $fstype"
-      echo
-      echo 'This path behaves like a local directory, but I/O includes the network and remote storage.'
-      echo 'An I/O benchmark measures the complete NFS path, not just a disk.'
-      echo 'Raw .img mode is not inferred from an NFS mount because it is not a local block device.'
-      echo
-      waitkey
-      log "NFS_DETECTED target=$target source=$source fstype=$fstype options=$options"
-      ;;
-  esac
+check_terminal(){
+  local rows cols
+  read -r rows cols < <(stty size 2>/dev/null) || return 0
+  [[ $rows =~ ^[0-9]+$ && $cols =~ ^[0-9]+$ ]] || return 0
+  if ((rows < 18 || cols < 80)); then
+    printf 'Terminal too small (%sx%s). Resize to at least 80 columns × 18 rows and retry.\n' "$cols" "$rows" >&2
+    return 2
+  fi
 }
-
-choose_dst(){ choose_dst_v23; nfs_probe; }
 
 sftp_quote(){
   local s=$1
@@ -113,8 +75,20 @@ execute(){ case $TRANSPORT in sftp-after) sftp_after_execute;; *) execute_v23;; 
 
 main(){
   [[ ${1:-} == --self-test ]] && { self; private_host 192.168.1.2; ! private_host 8.8.8.8; echo 'SFTP/NFS self-test: OK'; return; }
-  [[ -t 0 && -t 1 ]] || { echo 'TTY required'; exit 1; }
+  [[ -t 0 && -t 1 ]] || { echo 'TTY required' >&2; exit 1; }
+  check_terminal || exit $?
   tput civis 2>/dev/null||:
+  offer_remote_unmount
+  local unmounted
+  unmounted=$(unmounted_devices)
+  if [[ -n $unmounted ]]; then
+    ui
+    echo 'Detected unmounted filesystem devices (left untouched; no automatic mount):'
+    printf '  %-18s %-10s %-14s %s\n' DEVICE FILESYSTEM MEDIA SIZE
+    while IFS=$'\t' read -r dev fs hw size; do printf '  %-18s %-10s %-14s %s\n' "$dev" "$fs" "$hw" "$size"; done <<<"$unmounted"
+    echo
+    waitkey
+  fi
   local rq r
   rq=$(ask 'Source file or directory' /)
   [[ -e $rq || -b $rq ]] || { ui; echo "Source does not exist: $rq"; waitkey; return 2; }
@@ -142,11 +116,12 @@ main(){
     log "DST=$DST DEV=$DDEV FS=$DFS MEDIA=$DMEDIA LINK=$DLINK NFS=$DST_IS_NFS NFS_SOURCE=$NFS_SOURCE"
     if [[ $SRC_KIND == directory || $SRC_KIND == mountpoint ]]; then base_ex; mount_selector; else EX=(); fi
     yes 'Run safe zstd CPU benchmark in tmpfs?' Y && cpu_bench || :
-    if ((DST_IS_NFS)); then yes 'Run end-to-end NFS destination I/O benchmark with a temporary file?' N && io_bench || :; else yes 'Run destination I/O benchmark with temporary file?' N && io_bench || :; fi
+    if [[ $DST_IS_NFS == 1 || $DMEDIA == NETWORK || $DMEDIA == FUSE || $DFS == nfs* || $DFS == fuse.* ]]; then log "IO_BENCH skip remote_or_fuse target=$DFS"; echo 'I/O benchmark skipped for network/FUSE destinations; no remote test file will be written.'; else yes 'Run destination I/O benchmark with temporary file?' N && io_bench || :; fi
     strategy; format_options; home_root; passwords; nameout
     if [[ $TRANSPORT == scp-after || $TRANSPORT == sftp-after ]]; then network_config || return $?; fi
   fi
 
+  critical_mounts || { ui; echo 'Backup cancelled: critical filesystem coverage was not confirmed.'; waitkey; return 2; }
   summary
   yes 'Confirmation 1/2: Is this plan correct?' N || return
   yes 'Confirmation 2/2: Are you SURE you want to start?' N || return

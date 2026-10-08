@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HERE="${BACKUP_TUI_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 CORE="$HERE/rsync-backup-tui-bash-core.sh"
 [[ -r "$CORE" ]] || { echo "Missing core: $CORE" >&2; exit 1; }
 
@@ -22,7 +22,8 @@ zstd_parallelism(){
   local -a a
   n=$(nproc 2>/dev/null||echo 1)
   a=("All threads ($n) — fastest" "Half threads ($((n>1?n/2:1))) — leave CPU headroom" 'Single thread — lowest CPU pressure')
-  c=$(choose 'zstd parallelism' 0 "${a[@]}")
+  choose 'zstd parallelism' 0 "${a[@]}"
+  c=$CHOOSE_RESULT
   case $c in
     0) ZTH=0;;
     1) ZTH=$((n>1?n/2:1));;
@@ -71,7 +72,8 @@ format_options(){
       TAR_META=0
       yes 'Store Linux ACLs, xattrs and numeric ownership in the tar archive?' Y && TAR_META=1 || :
       a=('Level 1 — fastest / least compression' 'Level 3 — balanced [recommended]' 'Level 6 — stronger compression / more CPU' 'Level 9 — high compression / slower')
-      c=$(choose 'zstd compression level' 1 "${a[@]}")
+      choose 'zstd compression level' 1 "${a[@]}"
+      c=$CHOOSE_RESULT
       case $c in 0) ZLVL=1;; 1) ZLVL=3;; 2) ZLVL=6;; 3) ZLVL=9;; esac
       zstd_parallelism
       ;;
@@ -82,7 +84,8 @@ format_options(){
       echo
       waitkey
       a=('Store only (-0) — no compression' 'Fast (-1)' 'Balanced (-6) [recommended]' 'Maximum (-9)')
-      c=$(choose 'ZIP compression level' 2 "${a[@]}")
+      choose 'ZIP compression level' 2 "${a[@]}"
+      c=$CHOOSE_RESULT
       case $c in 0) ZIP_LEVEL=0;; 1) ZIP_LEVEL=1;; 2) ZIP_LEVEL=6;; 3) ZIP_LEVEL=9;; esac
       ZIP_SPLIT=0
       if [[ $DFS == vfat ]]; then
@@ -115,7 +118,8 @@ format_options(){
       fi
       if [[ $STRAT == img.zst ]]; then
         a=('Level 1 — fastest' 'Level 3 — balanced [recommended]' 'Level 6 — stronger compression' 'Level 9 — high compression')
-        c=$(choose 'zstd compression level for image' 1 "${a[@]}")
+        choose 'zstd compression level for image' 1 "${a[@]}"
+        c=$CHOOSE_RESULT
         case $c in 0) ZLVL=1;; 1) ZLVL=3;; 2) ZLVL=6;; 3) ZLVL=9;; esac
         zstd_parallelism
       fi
